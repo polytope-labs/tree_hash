@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::{Hash256, MerkleHasher, BYTES_PER_CHUNK};
 use ethereum_hashing::hash32_concat;
 use smallvec::SmallVec;
@@ -7,14 +8,15 @@ pub enum Error {
     MerkleHasher(crate::merkle_hasher::Error),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::MerkleHasher(e) => write!(f, "{e}"),
         }
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -108,7 +110,7 @@ impl ProgressiveMerkleHasher {
                 return Ok(());
             }
 
-            let chunk = std::mem::take(&mut self.buffer);
+            let chunk = core::mem::take(&mut self.buffer);
             self.process_chunk(&chunk)?;
         }
 

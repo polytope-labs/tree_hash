@@ -1,3 +1,8 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+
 pub mod impls;
 mod merkle_hasher;
 mod merkleize_padded;
@@ -27,7 +32,7 @@ pub type PackedEncoding = SmallVec<[u8; SMALLVEC_SIZE]>;
 ///
 /// `minimum_leaf_count` will only be used if it is greater than or equal to the minimum number of leaves that can be created from `bytes`.
 pub fn merkle_root(bytes: &[u8], minimum_leaf_count: usize) -> Hash256 {
-    let leaves = std::cmp::max(bytes.len().div_ceil(HASHSIZE), minimum_leaf_count);
+    let leaves = core::cmp::max(bytes.len().div_ceil(HASHSIZE), minimum_leaf_count);
 
     if leaves == 0 {
         // If there are no bytes then the hash is always zero.
@@ -60,7 +65,7 @@ pub fn merkle_root(bytes: &[u8], minimum_leaf_count: usize) -> Hash256 {
 ///
 /// Used in `TreeHash` for inserting the length of a list above it's root.
 pub fn mix_in_length(root: &Hash256, length: usize) -> Hash256 {
-    let usize_len = std::mem::size_of::<usize>();
+    let usize_len = core::mem::size_of::<usize>();
 
     let mut length_bytes = [0; BYTES_PER_CHUNK];
     length_bytes[0..usize_len].copy_from_slice(&length.to_le_bytes());
