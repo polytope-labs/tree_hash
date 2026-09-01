@@ -11,11 +11,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-alloy-primitives = "1"
+alloy-primitives = { version = "1", default-features = false }
 ethereum_hashing = { version = "0.8", default-features = false, features = ["zero_hash_cache"]  }
-ethereum_ssz = "0.10"
-smallvec = "1"
-typenum = "1"
+ethereum_ssz = { version = "0.10", default-features = false }
+smallvec = { version = "1", default-features = false }
+typenum = { version = "1", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
@@ -25,6 +25,8 @@ ethereum_ssz_derive = "0.10"
 trybuild = "1"
 
 [features]
-default = ["ring"]
+default = ["std", "ring"]
+std = ["alloy-primitives/std", "ethereum_ssz/std", "ethereum_hashing/std"]
 arbitrary = ["alloy-primitives/arbitrary"]
 ring = ["ethereum_hashing/ring"]
+sha2 = ["ethereum_hashing/sha2"]

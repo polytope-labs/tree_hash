@@ -1,7 +1,7 @@
 use crate::{get_zero_hash, Hash256, HASHSIZE};
+use core::mem;
 use ethereum_hashing::{Context, Sha256Context, HASH_LEN};
 use smallvec::{smallvec, SmallVec};
-use std::mem;
 
 type SmallVec8<T> = SmallVec<[T; 8]>;
 
@@ -11,8 +11,8 @@ pub enum Error {
     MaximumLeavesExceeded { max_leaves: usize },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::MaximumLeavesExceeded { max_leaves } => write!(
                 f,
@@ -22,6 +22,7 @@ impl std::fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 /// Helper struct to store either a hash digest or a slice.
@@ -215,7 +216,7 @@ impl MerkleHasher {
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let mut ptr = 0;
         while ptr <= bytes.len() {
-            let slice = &bytes[ptr..std::cmp::min(bytes.len(), ptr + HASHSIZE)];
+            let slice = &bytes[ptr..core::cmp::min(bytes.len(), ptr + HASHSIZE)];
 
             if self.buffer.is_empty() && slice.len() == HASHSIZE {
                 self.process_leaf(slice)?;
