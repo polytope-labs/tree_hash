@@ -14,7 +14,8 @@ repository = "https://github.com/sigp/tree_hash"
 keywords = ["ethereum"]
 categories = ["cryptography::cryptocurrencies"]
 
-# TODO: Remove once ethereum_ssz is published.
 [patch.crates-io]
-ethereum_ssz = { git = "https://github.com/sigp/ethereum_ssz", rev = "258380e245c0b1281efbe10923894321eba99738" }
-ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "258380e245c0b1281efbe10923894321eba99738" }
+ethereum_ssz = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "08fae4f6a8e22832654c8eb9fff500629e46f83b" }
+ethereum_ssz_derive = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "08fae4f6a8e22832654c8eb9fff500629e46f83b" }
+ethereum_serde_utils = { git = "https://github.com/polytope-labs/ethereum_serde_utils", rev = "b67233cce50833e2082ebcb16a9971df063c7ecb" }
+ethereum_hashing = { git = "https://github.com/polytope-labs/ethereum_hashing", rev = "777b16da793573d5a0dd37d33d77f24ce4b624e7" }
