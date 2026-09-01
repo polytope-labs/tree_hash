@@ -35,6 +35,44 @@ use alloc::{vec, vec::Vec};
 use crate::{Hash256, BYTES_PER_CHUNK};
 use ethereum_hashing::hash32_concat;
 
+/// The field roots of a container, in chunk order.
+pub type FieldRoots = Vec<Hash256>;
+
+/// A progressive container that can hand out its field roots, so proofs can be built over it.
+///
+/// Derived automatically by `#[derive(TreeHash)]` with
+/// `#[tree_hash(struct_behaviour = "progressive_container")]`. `tree_hash_root` consumes the field
+/// roots as it streams them, so this trait is what makes them available a second time.
+pub trait TreeHashFields {
+    /// The packed `active_fields` bitmask mixed into the container root.
+    const ACTIVE_FIELDS: [u8; BYTES_PER_CHUNK];
+
+    /// The container's field roots in chunk order, with a zero root for every inactive field so
+    /// that positions, and therefore generalized indices, stay stable across forks.
+    fn field_roots(&self) -> FieldRoots;
+
+    /// The container root, which must equal this type's `tree_hash_root`.
+    fn container_root(&self) -> Hash256 {
+        progressive_container_root(&self.field_roots(), Self::ACTIVE_FIELDS)
+    }
+
+    /// Prove the field at `field_index`, returning its root and the branch to the container root.
+    ///
+    /// Verify with [`is_valid_merkle_branch`] against
+    /// [`progressive_container_gindex(field_index)`](progressive_container_gindex).
+    fn prove_field(&self, field_index: usize) -> Result<(Hash256, Vec<Hash256>), Error> {
+        let roots = self.field_roots();
+        let leaf = *roots
+            .get(field_index)
+            .ok_or(Error::FieldIndexOutOfBounds {
+                index: field_index,
+                len: roots.len(),
+            })?;
+        let branch = progressive_container_proof(&roots, Self::ACTIVE_FIELDS, field_index)?;
+        Ok((leaf, branch))
+    }
+}
+
 /// Errors returned when building a proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -42,6 +80,12 @@ pub enum Error {
     FieldIndexOutOfBounds { index: usize, len: usize },
     /// No field roots were supplied, so there is nothing to prove.
     NoFields,
+    /// A multiproof was given a different number of leaves and indices.
+    LeafCountMismatch { leaves: usize, indices: usize },
+    /// A multiproof carried a different number of nodes than its indices require.
+    ProofCountMismatch { proof: usize, expected: usize },
+    /// A multiproof did not contain enough nodes to reach the root.
+    IncompleteProof,
 }
 
 /// The number of leaves in the binary subtree at `level`.
@@ -244,6 +288,116 @@ pub fn is_valid_merkle_branch(
     value == root
 }
 
+/// Multiproofs over ordinary fixed depth containers.
+///
+/// Progressive containers cover the Gloas `BeaconState`, but pre-Gloas forks still prove several
+/// fields of one container at once (the execution payload header's state root, block number and
+/// timestamp), and those containers are ordinary balanced trees. This is the multiproof algorithm
+/// from the consensus specs' `ssz/merkle-proofs.md`, which both shapes share.
+pub mod multiproof {
+    use super::*;
+    use alloc::collections::{BTreeMap, BTreeSet};
+
+    /// The sibling of `index`.
+    const fn sibling(index: u64) -> u64 {
+        index ^ 1
+    }
+
+    /// The generalized indices of the siblings on the path from `index` up to the root.
+    fn branch_indices(index: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut index = index;
+        while index > 1 {
+            out.push(sibling(index));
+            index /= 2;
+        }
+        out
+    }
+
+    /// The generalized indices on the path from `index` up to, but excluding, the root.
+    fn path_indices(index: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut index = index;
+        while index > 1 {
+            out.push(index);
+            index /= 2;
+        }
+        out
+    }
+
+    /// The generalized indices whose roots a verifier must be given to recompute the root from
+    /// `indices`, ordered deepest first.
+    ///
+    /// These are every sibling along every path, minus the nodes the proof can already derive.
+    pub fn get_helper_indices(indices: &[u64]) -> Vec<u64> {
+        let mut helpers = BTreeSet::new();
+        let mut known = BTreeSet::new();
+
+        for index in indices {
+            helpers.extend(branch_indices(*index));
+            known.extend(path_indices(*index));
+            known.insert(*index);
+        }
+
+        let mut out: Vec<u64> = helpers.difference(&known).copied().collect();
+        // Deepest first, which is the order `calculate_multi_merkle_root` consumes them in.
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        out
+    }
+
+    /// Recompute the root from `leaves` at `indices`, given the `proof` nodes named by
+    /// [`get_helper_indices`] in the same order.
+    pub fn calculate_multi_merkle_root(
+        leaves: &[Hash256],
+        proof: &[Hash256],
+        indices: &[u64],
+    ) -> Result<Hash256, Error> {
+        if leaves.len() != indices.len() {
+            return Err(Error::LeafCountMismatch {
+                leaves: leaves.len(),
+                indices: indices.len(),
+            });
+        }
+        let helpers = get_helper_indices(indices);
+        if proof.len() != helpers.len() {
+            return Err(Error::ProofCountMismatch {
+                proof: proof.len(),
+                expected: helpers.len(),
+            });
+        }
+
+        let mut objects: BTreeMap<u64, Hash256> = indices
+            .iter()
+            .copied()
+            .zip(leaves.iter().copied())
+            .chain(helpers.iter().copied().zip(proof.iter().copied()))
+            .collect();
+
+        // Walk deepest first, combining any pair whose parent is not yet known.
+        let mut keys: Vec<u64> = objects.keys().copied().collect();
+        keys.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut pos = 0;
+        while pos < keys.len() {
+            let key = keys[pos];
+            let has_sibling = objects.contains_key(&sibling(key));
+            let parent = key / 2;
+            if key > 1 && has_sibling && !objects.contains_key(&parent) {
+                let left = objects[&(key & !1)];
+                let right = objects[&(key | 1)];
+                objects.insert(
+                    parent,
+                    Hash256::from(hash32_concat(left.as_slice(), right.as_slice())),
+                );
+                keys.push(parent);
+            }
+            pos += 1;
+        }
+
+        objects.get(&1).copied().ok_or(Error::IncompleteProof)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +570,127 @@ mod tests {
             progressive_container_gindex(24),
             root
         ));
+    }
+
+    mod multiproofs {
+        use super::*;
+        use crate::proof::multiproof::{calculate_multi_merkle_root, get_helper_indices};
+
+        /// Read the node at `gindex` out of a bottom up binary tree.
+        fn node_at(tree: &[Vec<Hash256>], gindex: u64) -> Hash256 {
+            let depth = gindex.ilog2() as usize;
+            let total = tree.len() - 1;
+            tree[total - depth][(gindex - (1 << depth)) as usize]
+        }
+
+        /// A balanced 16 leaf container, the shape of an ordinary fixed depth SSZ container.
+        fn fixture() -> (Vec<Hash256>, Vec<Vec<Hash256>>, Hash256) {
+            let leaves = field_roots(16);
+            let tree = binary_tree(&leaves, 16);
+            let root = *tree.last().unwrap().first().unwrap();
+            (leaves, tree, root)
+        }
+
+        #[test]
+        fn a_single_index_recomputes_the_root() {
+            let (leaves, tree, root) = fixture();
+            let index = 16 + 5;
+
+            let helpers = get_helper_indices(&[index]);
+            let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+
+            assert_eq!(
+                calculate_multi_merkle_root(&[leaves[5]], &proof, &[index]).unwrap(),
+                root
+            );
+        }
+
+        /// The pre-Gloas execution payload case: three fields of one container proven together.
+        #[test]
+        fn three_indices_recompute_the_root() {
+            let (leaves, tree, root) = fixture();
+            let indices = [16 + 2, 16 + 8, 16 + 9];
+            let picked = [leaves[2], leaves[8], leaves[9]];
+
+            let helpers = get_helper_indices(&indices);
+            let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+
+            assert_eq!(
+                calculate_multi_merkle_root(&picked, &proof, &indices).unwrap(),
+                root
+            );
+        }
+
+        /// Sibling leaves share a parent, so the shared node must not be sent twice.
+        #[test]
+        fn sibling_indices_do_not_duplicate_helpers() {
+            let (leaves, tree, root) = fixture();
+            let indices = [16 + 8, 16 + 9];
+
+            let helpers = get_helper_indices(&indices);
+            assert!(!helpers.contains(&(16 + 8)));
+            assert!(!helpers.contains(&(16 + 9)));
+
+            let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+            assert_eq!(
+                calculate_multi_merkle_root(&[leaves[8], leaves[9]], &proof, &indices).unwrap(),
+                root
+            );
+        }
+
+        #[test]
+        fn every_index_subset_recomputes_the_root() {
+            let (leaves, tree, root) = fixture();
+
+            // Exhaustive over all non-empty subsets of a 4 leaf prefix, plus a wider sweep.
+            for mask in 1u32..(1 << 8) {
+                let picked: Vec<usize> = (0..8).filter(|i| mask & (1 << i) != 0).collect();
+                let indices: Vec<u64> = picked.iter().map(|i| 16 + *i as u64).collect();
+                let values: Vec<Hash256> = picked.iter().map(|i| leaves[*i]).collect();
+
+                let helpers = get_helper_indices(&indices);
+                let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+
+                assert_eq!(
+                    calculate_multi_merkle_root(&values, &proof, &indices).unwrap(),
+                    root,
+                    "subset {mask:08b}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_tampered_leaf_does_not_reach_the_root() {
+            let (leaves, tree, root) = fixture();
+            let indices = [16 + 2, 16 + 8];
+
+            let helpers = get_helper_indices(&indices);
+            let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+
+            let wrong = calculate_multi_merkle_root(&[leaves[3], leaves[8]], &proof, &indices)
+                .unwrap();
+            assert_ne!(wrong, root);
+        }
+
+        #[test]
+        fn mismatched_lengths_are_rejected() {
+            let (leaves, tree, _) = fixture();
+            let indices = [16 + 2, 16 + 8];
+            let helpers = get_helper_indices(&indices);
+            let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
+
+            assert_eq!(
+                calculate_multi_merkle_root(&[leaves[2]], &proof, &indices),
+                Err(Error::LeafCountMismatch { leaves: 1, indices: 2 })
+            );
+            assert_eq!(
+                calculate_multi_merkle_root(&[leaves[2], leaves[8]], &proof[1..], &indices),
+                Err(Error::ProofCountMismatch {
+                    proof: proof.len() - 1,
+                    expected: proof.len()
+                })
+            );
+        }
     }
 
     #[test]
