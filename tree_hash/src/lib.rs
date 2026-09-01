@@ -7,6 +7,7 @@ mod merkle_hasher;
 mod merkleize_padded;
 mod merkleize_standard;
 mod progressive_merkle_hasher;
+pub mod proof;
 
 pub use merkle_hasher::{Error, MerkleHasher};
 pub use merkleize_padded::merkleize_padded;
