@@ -2,6 +2,9 @@ use alloy_primitives::{Address, U128, U160, U256};
 use ssz::ProgressiveBitList;
 use ssz_derive::Encode;
 use std::str::FromStr;
+use tree_hash::proof::{
+    is_valid_merkle_branch, progressive_container_gindex, TreeHashFields,
+};
 use tree_hash::{
     merkle_root, mix_in_active_fields, Hash256, MerkleHasher, PackedEncoding,
     ProgressiveMerkleHasher, TreeHash, BYTES_PER_CHUNK,
@@ -707,4 +710,101 @@ fn progressive_container_and_compatible_union_are_container_type() {
         CompatUnion::tree_hash_type(),
         tree_hash::TreeHashType::Container
     );
+}
+
+/// A container shaped like the parts of the Gloas `BeaconState` we prove against: an inactive
+/// field in the middle, and enough fields to reach the third level of the spine.
+#[derive(TreeHash)]
+#[tree_hash(
+    struct_behaviour = "progressive_container",
+    active_fields(1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+)]
+struct ProgressiveContainerProvable {
+    a: u64,
+    b: u64,
+    c: u64,
+    // index 3 is inactive
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    h: u64,
+    i: u64,
+    j: u64,
+    k: u64,
+    l: u64,
+    m: u64,
+    n: u64,
+    o: u64,
+    p: u64,
+    q: u64,
+    r: u64,
+    s: u64,
+    t: u64,
+    u: u64,
+    v: u64,
+    w: u64,
+    x: u64,
+}
+
+fn provable_container() -> ProgressiveContainerProvable {
+    ProgressiveContainerProvable {
+        a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12,
+        m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20, u: 21, v: 22, w: 23, x: 24,
+    }
+}
+
+/// The derived `field_roots` must reproduce the derived `tree_hash_root`. If these drift, proofs
+/// would be built over a tree the container does not actually hash to.
+#[test]
+fn derived_field_roots_reproduce_the_derived_root() {
+    let container = provable_container();
+    assert_eq!(container.container_root(), container.tree_hash_root());
+}
+
+/// An inactive field still occupies its chunk, so it hashes as zero and every later field keeps
+/// its generalized index.
+#[test]
+fn derived_inactive_fields_are_zero_leaves() {
+    let roots = provable_container().field_roots();
+    assert_eq!(roots.len(), 25);
+    assert_eq!(roots[3], Hash256::ZERO);
+    assert_eq!(roots[2], 3u64.tree_hash_root());
+    assert_eq!(roots[4], 4u64.tree_hash_root());
+}
+
+/// The end to end case: a proof built from the derive verifies against the container's own root.
+#[test]
+fn derived_container_fields_prove_against_the_root() {
+    let container = provable_container();
+    let root = container.tree_hash_root();
+
+    for index in 0..25 {
+        let (leaf, branch) = container.prove_field(index).unwrap();
+        assert!(
+            is_valid_merkle_branch(leaf, &branch, progressive_container_gindex(index), root),
+            "field {index} failed to verify against the derived root"
+        );
+    }
+}
+
+/// A field's proof must not verify at another field's generalized index.
+#[test]
+fn derived_proofs_are_bound_to_their_field() {
+    let container = provable_container();
+    let root = container.tree_hash_root();
+
+    let (leaf, branch) = container.prove_field(23).unwrap();
+    assert!(is_valid_merkle_branch(
+        leaf,
+        &branch,
+        progressive_container_gindex(23),
+        root
+    ));
+    assert!(!is_valid_merkle_branch(
+        leaf,
+        &branch,
+        progressive_container_gindex(24),
+        root
+    ));
 }
