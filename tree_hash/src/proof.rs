@@ -100,6 +100,13 @@ pub enum Error {
     IncompleteProof,
     /// A generalized index falls outside the tree built from the supplied field roots.
     GindexOutOfTree { gindex: u64 },
+    /// A multiproof index set contained 0, which addresses no node.
+    ZeroIndex,
+    /// A multiproof index set contained the same index twice.
+    DuplicateIndex { gindex: u64 },
+    /// A multiproof index set contained a node and one of its descendants. The descendant's leaf
+    /// would never be hashed into the root, so any value would pass for it.
+    OverlappingIndices { ancestor: u64, descendant: u64 },
 }
 
 impl core::fmt::Display for Error {
@@ -117,6 +124,11 @@ impl core::fmt::Display for Error {
             }
             Error::IncompleteProof => write!(f, "proof did not reach the root"),
             Error::GindexOutOfTree { gindex } => write!(f, "gindex {gindex} is outside the tree"),
+            Error::ZeroIndex => write!(f, "index 0 addresses no node"),
+            Error::DuplicateIndex { gindex } => write!(f, "index {gindex} appears twice"),
+            Error::OverlappingIndices { ancestor, descendant } => {
+                write!(f, "index {ancestor} is an ancestor of {descendant}")
+            }
         }
     }
 }
@@ -124,33 +136,57 @@ impl core::fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// The number of leaves in the binary subtree at `level`.
-const fn level_size(level: usize) -> usize {
-    1 << (2 * level)
+/// The deepest level whose spine base still fits in a `u64`.
+///
+/// Level `k`'s base is `(2^(k+2) - 2) * 4^k`, which passes `u64::MAX` just after level 20. Levels
+/// beyond this cannot address a real field, so they are refused rather than allowed to wrap.
+const MAX_LEVEL: usize = 20;
+
+/// The number of leaves in the binary subtree at `level`, or `None` past [`MAX_LEVEL`].
+const fn level_size(level: usize) -> Option<usize> {
+    if level > MAX_LEVEL {
+        return None;
+    }
+    Some(1usize << (2 * level))
 }
 
-/// The index of the first field held by `level`.
+/// The index of the first field held by `level`, or `None` past [`MAX_LEVEL`].
 ///
 /// Levels hold `1, 4, 16, 64, ...` fields, so the first index of level `k` is `(4^k - 1) / 3`.
-const fn level_start(level: usize) -> usize {
-    (level_size(level) - 1) / 3
+const fn level_start(level: usize) -> Option<usize> {
+    match level_size(level) {
+        Some(size) => Some((size - 1) / 3),
+        None => None,
+    }
 }
 
 /// The level holding `field_index`, and the offset of the field within that level.
-fn locate(field_index: usize) -> (usize, usize) {
+///
+/// Returns `None` for an index no progressive container can hold. The bound is checked before the
+/// arithmetic that would otherwise wrap, so this terminates for every input, including on 32 bit
+/// targets where a wrapping shift would previously loop forever.
+fn locate(field_index: usize) -> Option<(usize, usize)> {
     let mut level = 0;
-    while level_start(level + 1) <= field_index {
-        level += 1;
+    loop {
+        match level_start(level + 1) {
+            Some(next) if next <= field_index => level += 1,
+            Some(_) => break,
+            None => return None,
+        }
     }
-    (level, field_index - level_start(level))
+    let start = level_start(level)?;
+    Some((level, field_index - start))
 }
 
 /// The generalized index of the left (binary subtree) child at `level`, within the progressive
 /// tree alone, before `active_fields` is mixed in.
 ///
 /// The spine puts these at `2, 6, 14, 30, ...`, which is `2^(k + 2) - 2`.
-const fn level_gindex(level: usize) -> u64 {
-    (1u64 << (level + 2)) - 2
+const fn level_gindex(level: usize) -> Option<u64> {
+    if level > MAX_LEVEL {
+        return None;
+    }
+    Some((1u64 << (level + 2)) - 2)
 }
 
 /// The generalized index of `field_index` in a progressive container.
@@ -159,30 +195,37 @@ const fn level_gindex(level: usize) -> u64 {
 /// `active_fields` mix in. Note that unlike a fixed depth container, two fields of the same
 /// container generally sit at different depths.
 ///
+/// Returns `None` for an index no progressive container can hold, rather than wrapping or
+/// panicking on the shift.
+///
 /// ```
 /// # use tree_hash::proof::progressive_container_gindex;
 /// // Fields 20, 23 and 24 of a 46 field container.
-/// assert_eq!(progressive_container_gindex(20), 367);
-/// assert_eq!(progressive_container_gindex(23), 2946);
-/// assert_eq!(progressive_container_gindex(24), 2947);
+/// assert_eq!(progressive_container_gindex(20), Some(367));
+/// assert_eq!(progressive_container_gindex(23), Some(2946));
+/// assert_eq!(progressive_container_gindex(24), Some(2947));
 /// ```
-pub fn progressive_container_gindex(field_index: usize) -> u64 {
-    let (level, offset) = locate(field_index);
+pub fn progressive_container_gindex(field_index: usize) -> Option<u64> {
+    let (level, offset) = locate(field_index)?;
 
     // Position within the progressive tree, whose root is the left child of the final root.
-    let within = level_gindex(level) * level_size(level) as u64 + offset as u64;
+    let within = level_gindex(level)?
+        .checked_mul(level_size(level)? as u64)?
+        .checked_add(offset as u64)?;
 
     // Graft that subtree under the left child of the final root. Stripping the leading one bit and
     // re-attaching it below the root's left child is the same as adding it back one place higher.
-    within + (1u64 << within.ilog2())
+    within.checked_add(1u64 << within.ilog2())
 }
 
 /// The depth of `field_index`, which is the number of nodes in its branch.
-pub fn progressive_container_depth(field_index: usize) -> usize {
-    let (level, _) = locate(field_index);
+///
+/// Returns `None` for an index no progressive container can hold.
+pub fn progressive_container_depth(field_index: usize) -> Option<usize> {
+    let (level, _) = locate(field_index)?;
     // `2 * level` within the binary subtree, one for the spine sibling at this level, `level` more
     // walking back up the spine, and one for `active_fields`.
-    3 * level + 2
+    Some(3 * level + 2)
 }
 
 /// Build a binary merkle tree over `leaves`, zero padding up to `size`.
@@ -208,10 +251,12 @@ fn binary_tree(leaves: &[Hash256], size: usize) -> Vec<Vec<Hash256>> {
 fn level_roots(field_roots: &[Hash256]) -> Vec<Hash256> {
     let mut roots = Vec::new();
     let mut level = 0;
-    while level_start(level) < field_roots.len() {
-        let start = level_start(level);
-        let end = (start + level_size(level)).min(field_roots.len());
-        let tree = binary_tree(&field_roots[start..end], level_size(level));
+    while let (Some(start), Some(size)) = (level_start(level), level_size(level)) {
+        if start >= field_roots.len() {
+            break;
+        }
+        let end = (start + size).min(field_roots.len());
+        let tree = binary_tree(&field_roots[start..end], size);
         roots.push(*tree.last().and_then(|l| l.first()).expect("tree has a root"));
         level += 1;
     }
@@ -263,14 +308,22 @@ pub fn progressive_container_proof(
         });
     }
 
-    let (level, offset) = locate(field_index);
+    let (level, offset) =
+        locate(field_index).ok_or(Error::FieldIndexOutOfBounds { index: field_index, len: field_roots.len() })?;
     let levels = level_roots(field_roots);
 
-    let start = level_start(level);
-    let end = (start + level_size(level)).min(field_roots.len());
-    let tree = binary_tree(&field_roots[start..end], level_size(level));
+    let size = level_size(level).ok_or(Error::FieldIndexOutOfBounds {
+        index: field_index,
+        len: field_roots.len(),
+    })?;
+    let start = level_start(level).ok_or(Error::FieldIndexOutOfBounds {
+        index: field_index,
+        len: field_roots.len(),
+    })?;
+    let end = (start + size).min(field_roots.len());
+    let tree = binary_tree(&field_roots[start..end], size);
 
-    let mut branch = Vec::with_capacity(progressive_container_depth(field_index));
+    let mut branch = Vec::new();
 
     // Sibling path up the binary subtree holding the field.
     let mut index = offset;
@@ -297,6 +350,14 @@ pub fn progressive_container_proof(
 ///
 /// The bits of `gindex` above its leading one describe the path, so this handles the ragged depths
 /// a progressive container produces without being told the depth separately.
+///
+/// # The caller owns the gindex
+///
+/// A proof of an interior node is a perfectly valid proof *at that node's gindex*. This function
+/// answers only "does this branch put this leaf at this index", so the index must come from the
+/// verifier's own configuration and never from the prover or from the proof being checked. Taking
+/// it from the proof would let a prover choose which position it is proving, which is no proof at
+/// all.
 pub fn is_valid_merkle_branch(
     leaf: Hash256,
     branch: &[Hash256],
@@ -332,20 +393,29 @@ pub fn field_index_for_gindex(gindex: u64) -> Option<usize> {
     if gindex < 2 {
         return None;
     }
+    let top = gindex.ilog2();
+
+    // The container hangs off the root's *left* child, so for any real field the bit just below
+    // the leading one is clear. When it is set the gindex addresses the `active_fields` side of
+    // the mix in; gindex 3 is that leaf, and without this check it would be mistaken for field 0.
+    if top >= 1 && (gindex >> (top - 1)) & 1 == 1 {
+        return None;
+    }
+
     // Undo the graft under the root's left child.
-    let within = gindex.checked_sub(1u64 << (gindex.ilog2().checked_sub(1)?))?;
+    let within = gindex.checked_sub(1u64 << top.checked_sub(1)?)?;
 
     let mut level = 0;
     loop {
-        let base = level_gindex(level) * level_size(level) as u64;
+        let base = level_gindex(level)?.checked_mul(level_size(level)? as u64)?;
         if within < base {
             return None;
         }
-        if within < base + level_size(level) as u64 {
-            return Some(level_start(level) + (within - base) as usize);
+        if within < base.checked_add(level_size(level)? as u64)? {
+            return Some(level_start(level)? + (within - base) as usize);
         }
         level += 1;
-        if level > 32 {
+        if level > MAX_LEVEL {
             return None;
         }
     }
@@ -363,6 +433,7 @@ pub fn generate_multiproof(
     if field_roots.is_empty() {
         return Err(Error::NoFields);
     }
+    multiproof::validate_indices(gindices)?;
     let leaves = field_roots.len().next_power_of_two();
     let tree = binary_tree(field_roots, leaves);
 
@@ -417,6 +488,39 @@ pub mod multiproof {
         out
     }
 
+    /// True when `ancestor` sits on the path from the root to `descendant`.
+    fn is_ancestor_of(ancestor: u64, descendant: u64) -> bool {
+        let (a, d) = (ancestor.ilog2(), descendant.ilog2());
+        a <= d && (descendant >> (d - a)) == ancestor
+    }
+
+    /// Reject index sets that would leave a leaf unverified.
+    ///
+    /// The algorithm in the consensus specs combines a node with its sibling and stops once a
+    /// parent is already known. If one index is an ancestor of another, the descendant's leaf is
+    /// never hashed into the root, so **any** value passes for it. The spec gets away with this
+    /// because it is always driven by hardcoded index sets; a runtime that takes indices from
+    /// configuration or untrusted data does not have that guarantee, so the shape is checked here.
+    pub fn validate_indices(indices: &[u64]) -> Result<(), Error> {
+        for (i, &a) in indices.iter().enumerate() {
+            if a == 0 {
+                return Err(Error::ZeroIndex);
+            }
+            for &b in &indices[i + 1..] {
+                if a == b {
+                    return Err(Error::DuplicateIndex { gindex: a });
+                }
+                if is_ancestor_of(a, b) {
+                    return Err(Error::OverlappingIndices { ancestor: a, descendant: b });
+                }
+                if is_ancestor_of(b, a) {
+                    return Err(Error::OverlappingIndices { ancestor: b, descendant: a });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The generalized indices whose roots a verifier must be given to recompute the root from
     /// `indices`, ordered deepest first.
     ///
@@ -450,6 +554,7 @@ pub mod multiproof {
                 indices: indices.len(),
             });
         }
+        validate_indices(indices)?;
         let helpers = get_helper_indices(indices);
         if proof.len() != helpers.len() {
             return Err(Error::ProofCountMismatch {
@@ -535,35 +640,112 @@ mod tests {
         }
     }
 
+    /// Reported in review: if one index is an ancestor of another, the descendant's leaf is never
+    /// hashed into the root, so any value passes for it. Not reachable through the light client's
+    /// hardcoded same depth indices, but it must not be reachable at all.
+    #[test]
+    fn overlapping_indices_are_rejected() {
+        use crate::proof::multiproof::calculate_multi_merkle_root;
+
+        let leaf = Hash256::repeat_byte(1);
+        let garbage = Hash256::repeat_byte(0xff);
+
+        // ancestor / descendant
+        assert_eq!(
+            calculate_multi_merkle_root(&[leaf, garbage], &[], &[2, 5]),
+            Err(Error::OverlappingIndices { ancestor: 2, descendant: 5 })
+        );
+        // the root itself as an index
+        assert_eq!(
+            calculate_multi_merkle_root(&[leaf, garbage], &[], &[1, 4]),
+            Err(Error::OverlappingIndices { ancestor: 1, descendant: 4 })
+        );
+        // duplicates
+        assert_eq!(
+            calculate_multi_merkle_root(&[garbage, leaf], &[], &[4, 4]),
+            Err(Error::DuplicateIndex { gindex: 4 })
+        );
+        // index 0 addresses no node
+        assert_eq!(
+            calculate_multi_merkle_root(&[garbage, leaf], &[], &[0, 4]),
+            Err(Error::ZeroIndex)
+        );
+    }
+
+    /// Sibling indices at the same depth, which is what the light client actually uses, still work.
+    #[test]
+    fn sibling_indices_are_still_accepted() {
+        use crate::proof::multiproof::{calculate_multi_merkle_root, get_helper_indices};
+
+        let roots = field_roots(16);
+        let tree = binary_tree(&roots, 16);
+        let root = *tree.last().unwrap().first().unwrap();
+        let indices = [16 + 2, 16 + 8, 16 + 9];
+
+        let proof = generate_multiproof(&roots, &indices).unwrap();
+        assert_eq!(proof.len(), get_helper_indices(&indices).len());
+        assert_eq!(
+            calculate_multi_merkle_root(&[roots[2], roots[8], roots[9]], &proof, &indices).unwrap(),
+            root
+        );
+    }
+
+    /// Reported in review: gindex 3 is the `active_fields` leaf, not field 0. The un-grafting step
+    /// has to check the bit below the leading one.
+    #[test]
+    fn the_active_fields_leaf_is_not_a_field() {
+        assert_eq!(field_index_for_gindex(3), None);
+        assert_eq!(field_index_for_gindex(2), None);
+        // and the real fields still invert
+        assert_eq!(field_index_for_gindex(367), Some(20));
+        assert_eq!(field_index_for_gindex(2947), Some(24));
+    }
+
+    /// Reported in review: unchecked shifts and multiplies panicked on 64 bit and looped forever on
+    /// 32 bit. Out of range indices must simply be refused.
+    #[test]
+    fn out_of_range_indices_do_not_panic_or_hang() {
+        assert_eq!(progressive_container_gindex(usize::MAX), None);
+        assert_eq!(progressive_container_depth(usize::MAX), None);
+        assert_eq!(field_index_for_gindex(u64::MAX), None);
+        assert_eq!(field_index_for_gindex(1u64 << 62), None);
+
+        // the boundary either resolves or refuses, but never wraps
+        for i in [357_913_941usize, 1 << 40, usize::MAX / 2] {
+            let _ = progressive_container_gindex(i);
+            let _ = progressive_container_depth(i);
+        }
+    }
+
     #[test]
     fn levels_start_where_the_spine_says() {
-        assert_eq!(level_start(0), 0);
-        assert_eq!(level_start(1), 1);
-        assert_eq!(level_start(2), 5);
-        assert_eq!(level_start(3), 21);
-        assert_eq!(level_start(4), 85);
+        assert_eq!(level_start(0), Some(0));
+        assert_eq!(level_start(1), Some(1));
+        assert_eq!(level_start(2), Some(5));
+        assert_eq!(level_start(3), Some(21));
+        assert_eq!(level_start(4), Some(85));
     }
 
     #[test]
     fn gindices_match_the_gloas_beacon_state() {
         // Checked against `eth-remerkleable`, the library the pyspec merkleizes with, for the 46
         // field Gloas `BeaconState`.
-        assert_eq!(progressive_container_gindex(20), 367);
-        assert_eq!(progressive_container_gindex(23), 2946);
-        assert_eq!(progressive_container_gindex(24), 2947);
+        assert_eq!(progressive_container_gindex(20), Some(367));
+        assert_eq!(progressive_container_gindex(23), Some(2946));
+        assert_eq!(progressive_container_gindex(24), Some(2947));
 
         // The depths are ragged, which the old fixed depth scheme assumed away.
-        assert_eq!(progressive_container_depth(20), 8);
-        assert_eq!(progressive_container_depth(23), 11);
-        assert_eq!(progressive_container_depth(24), 11);
+        assert_eq!(progressive_container_depth(20), Some(8));
+        assert_eq!(progressive_container_depth(23), Some(11));
+        assert_eq!(progressive_container_depth(24), Some(11));
     }
 
     #[test]
     fn gindex_depth_agrees_with_branch_length() {
         for i in 0..200 {
             assert_eq!(
-                progressive_container_gindex(i).ilog2() as usize,
-                progressive_container_depth(i),
+                progressive_container_gindex(i).unwrap().ilog2() as usize,
+                progressive_container_depth(i).unwrap(),
                 "field {i}"
             );
         }
@@ -577,9 +759,9 @@ mod tests {
 
         for i in 0..roots.len() {
             let branch = progressive_container_proof(&roots, active, i).unwrap();
-            assert_eq!(branch.len(), progressive_container_depth(i), "field {i}");
+            assert_eq!(branch.len(), progressive_container_depth(i).unwrap(), "field {i}");
             assert!(
-                is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i), root),
+                is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i).unwrap(), root),
                 "field {i} failed to verify"
             );
         }
@@ -595,7 +777,7 @@ mod tests {
             for i in 0..n {
                 let branch = progressive_container_proof(&roots, active, i).unwrap();
                 assert!(
-                    is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i), root),
+                    is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i).unwrap(), root),
                     "container of {n} fields, field {i}"
                 );
             }
@@ -609,7 +791,7 @@ mod tests {
         let root = progressive_container_root(&roots, active);
 
         let branch = progressive_container_proof(&roots, active, 24).unwrap();
-        let gindex = progressive_container_gindex(24);
+        let gindex = progressive_container_gindex(24).unwrap();
 
         assert!(is_valid_merkle_branch(roots[24], &branch, gindex, root));
         assert!(!is_valid_merkle_branch(roots[23], &branch, gindex, root));
@@ -620,7 +802,7 @@ mod tests {
         let roots = field_roots(46);
         let active = active_fields(46);
         let root = progressive_container_root(&roots, active);
-        let gindex = progressive_container_gindex(24);
+        let gindex = progressive_container_gindex(24).unwrap();
 
         let mut branch = progressive_container_proof(&roots, active, 24).unwrap();
         branch[0] = Hash256::ZERO;
@@ -643,7 +825,7 @@ mod tests {
         assert!(!is_valid_merkle_branch(
             roots[24],
             &branch,
-            progressive_container_gindex(24),
+            progressive_container_gindex(24).unwrap(),
             root
         ));
     }
@@ -659,7 +841,7 @@ mod tests {
         assert!(!is_valid_merkle_branch(
             roots[24],
             &branch,
-            progressive_container_gindex(24),
+            progressive_container_gindex(24).unwrap(),
             root
         ));
     }
@@ -667,7 +849,7 @@ mod tests {
     #[test]
     fn gindex_inversion_round_trips() {
         for i in 0..200 {
-            let gindex = progressive_container_gindex(i);
+            let gindex = progressive_container_gindex(i).unwrap();
             assert_eq!(field_index_for_gindex(gindex), Some(i), "field {i}");
         }
         // The gloas beacon state fields we care about.
