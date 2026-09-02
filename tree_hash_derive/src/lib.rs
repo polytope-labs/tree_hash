@@ -167,7 +167,7 @@ fn tree_hash_derive_struct(
                     )
                 };
                 active_field_index += 1;
-                field_hashes.push(quote! { self.#ident.tree_hash_root() });
+                field_hashes.push(quote! { tree_hash::TreeHash::tree_hash_root(&self.#ident) });
             } else {
                 field_hashes.push(quote! { tree_hash::Hash256::ZERO });
             }
@@ -203,7 +203,7 @@ fn tree_hash_derive_struct(
         (
             idents
                 .into_iter()
-                .map(|ident| quote! { self.#ident.tree_hash_root() })
+                .map(|ident| quote! { tree_hash::TreeHash::tree_hash_root(&self.#ident) })
                 .collect(),
             quote! { container_root },
         )
