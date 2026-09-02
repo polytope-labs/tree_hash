@@ -782,7 +782,7 @@ fn derived_container_fields_prove_against_the_root() {
     for index in 0..25 {
         let (leaf, branch) = container.prove_field(index).unwrap();
         assert!(
-            is_valid_merkle_branch(leaf, &branch, progressive_container_gindex(index), root),
+            is_valid_merkle_branch(leaf, &branch, progressive_container_gindex(index).unwrap(), root),
             "field {index} failed to verify against the derived root"
         );
     }
@@ -798,13 +798,13 @@ fn derived_proofs_are_bound_to_their_field() {
     assert!(is_valid_merkle_branch(
         leaf,
         &branch,
-        progressive_container_gindex(23),
+        progressive_container_gindex(23).unwrap(),
         root
     ));
     assert!(!is_valid_merkle_branch(
         leaf,
         &branch,
-        progressive_container_gindex(24),
+        progressive_container_gindex(24).unwrap(),
         root
     ));
 }
