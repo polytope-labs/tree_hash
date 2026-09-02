@@ -102,6 +102,28 @@ pub enum Error {
     GindexOutOfTree { gindex: u64 },
 }
 
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::FieldIndexOutOfBounds { index, len } => {
+                write!(f, "field index {index} out of bounds for {len} fields")
+            }
+            Error::NoFields => write!(f, "no field roots supplied"),
+            Error::LeafCountMismatch { leaves, indices } => {
+                write!(f, "{leaves} leaves for {indices} indices")
+            }
+            Error::ProofCountMismatch { proof, expected } => {
+                write!(f, "proof has {proof} nodes, expected {expected}")
+            }
+            Error::IncompleteProof => write!(f, "proof did not reach the root"),
+            Error::GindexOutOfTree { gindex } => write!(f, "gindex {gindex} is outside the tree"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
 /// The number of leaves in the binary subtree at `level`.
 const fn level_size(level: usize) -> usize {
     1 << (2 * level)
