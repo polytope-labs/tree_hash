@@ -3,7 +3,7 @@ use ssz::ProgressiveBitList;
 use ssz_derive::Encode;
 use std::str::FromStr;
 use tree_hash::proof::{
-    is_valid_merkle_branch, progressive_container_gindex, TreeHashFields,
+    is_valid_merkle_branch, progressive_container_gindex, ContainerFields, TreeHashFields,
 };
 use tree_hash::{
     merkle_root, mix_in_active_fields, Hash256, MerkleHasher, PackedEncoding,

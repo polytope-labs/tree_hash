@@ -209,31 +209,37 @@ fn tree_hash_derive_struct(
         )
     };
 
-    // Progressive containers additionally expose their field roots, so that merkle proofs can be
-    // built over them. `tree_hash_root` streams the roots and drops them, so without this they
-    // cannot be recovered from the container.
+    // Every container exposes its field roots so proofs can be built over it; `tree_hash_root`
+    // streams them and drops them, so without this they cannot be recovered from the container.
+    // Only progressive containers get `TreeHashFields`, whose helpers assume the progressive tree.
+    let field_roots = field_hashes.clone();
+    let container_fields_impl = quote! {
+        impl #impl_generics tree_hash::proof::ContainerFields for #name #ty_generics #where_clause {
+            fn field_roots(&self) -> tree_hash::proof::FieldRoots {
+                let mut roots = tree_hash::proof::FieldRoots::new();
+                #(
+                    roots.push(#field_roots);
+                )*
+                roots
+            }
+        }
+    };
+
     let fields_impl = if let StructBehaviour::ProgressiveContainer = struct_behaviour {
         let packed_active_fields = active_fields_opt
             .as_ref()
             .expect("active_fields is required for progressive_container")
             .packed_tokens();
         let active_fields_len = attrs::ACTIVE_FIELDS_PACKED_BYTES_LEN;
-        let field_roots = field_hashes.clone();
         quote! {
+            #container_fields_impl
+
             impl #impl_generics tree_hash::proof::TreeHashFields for #name #ty_generics #where_clause {
                 const ACTIVE_FIELDS: [u8; #active_fields_len] = #packed_active_fields;
-
-                fn field_roots(&self) -> tree_hash::proof::FieldRoots {
-                    let mut roots = tree_hash::proof::FieldRoots::new();
-                    #(
-                        roots.push(#field_roots);
-                    )*
-                    roots
-                }
             }
         }
     } else {
-        quote! {}
+        container_fields_impl
     };
 
     let output = quote! {

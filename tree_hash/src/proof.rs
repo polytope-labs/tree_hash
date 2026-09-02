@@ -38,18 +38,24 @@ use ethereum_hashing::hash32_concat;
 /// The field roots of a container, in chunk order.
 pub type FieldRoots = Vec<Hash256>;
 
+/// Any container that can hand out its field roots.
+///
+/// Derived by `#[derive(TreeHash)]` for both ordinary and progressive containers. `tree_hash_root`
+/// consumes the field roots as it streams them, so this trait is what makes them available a
+/// second time, whether for a balanced multiproof or a progressive branch.
+pub trait ContainerFields {
+    /// The container's field roots in chunk order.
+    fn field_roots(&self) -> FieldRoots;
+}
+
 /// A progressive container that can hand out its field roots, so proofs can be built over it.
 ///
 /// Derived automatically by `#[derive(TreeHash)]` with
 /// `#[tree_hash(struct_behaviour = "progressive_container")]`. `tree_hash_root` consumes the field
 /// roots as it streams them, so this trait is what makes them available a second time.
-pub trait TreeHashFields {
+pub trait TreeHashFields: ContainerFields {
     /// The packed `active_fields` bitmask mixed into the container root.
     const ACTIVE_FIELDS: [u8; BYTES_PER_CHUNK];
-
-    /// The container's field roots in chunk order, with a zero root for every inactive field so
-    /// that positions, and therefore generalized indices, stay stable across forks.
-    fn field_roots(&self) -> FieldRoots;
 
     /// The container root, which must equal this type's `tree_hash_root`.
     fn container_root(&self) -> Hash256 {
@@ -60,6 +66,12 @@ pub trait TreeHashFields {
     ///
     /// Verify with [`is_valid_merkle_branch`] against
     /// [`progressive_container_gindex(field_index)`](progressive_container_gindex).
+    fn prove_gindex(&self, gindex: u64) -> Result<(Hash256, Vec<Hash256>), Error> {
+        let field_index =
+            field_index_for_gindex(gindex).ok_or(Error::GindexOutOfTree { gindex })?;
+        self.prove_field(field_index)
+    }
+
     fn prove_field(&self, field_index: usize) -> Result<(Hash256, Vec<Hash256>), Error> {
         let roots = self.field_roots();
         let leaf = *roots
@@ -86,6 +98,8 @@ pub enum Error {
     ProofCountMismatch { proof: usize, expected: usize },
     /// A multiproof did not contain enough nodes to reach the root.
     IncompleteProof,
+    /// A generalized index falls outside the tree built from the supplied field roots.
+    GindexOutOfTree { gindex: u64 },
 }
 
 /// The number of leaves in the binary subtree at `level`.
@@ -286,6 +300,62 @@ pub fn is_valid_merkle_branch(
     }
 
     value == root
+}
+
+/// The field index a generalized index refers to, inverting [`progressive_container_gindex`].
+///
+/// Callers hold gindices in configuration (the beacon state's finalized root, next sync committee
+/// and execution leaf are named that way), while proof building works in field indices.
+pub fn field_index_for_gindex(gindex: u64) -> Option<usize> {
+    if gindex < 2 {
+        return None;
+    }
+    // Undo the graft under the root's left child.
+    let within = gindex.checked_sub(1u64 << (gindex.ilog2().checked_sub(1)?))?;
+
+    let mut level = 0;
+    loop {
+        let base = level_gindex(level) * level_size(level) as u64;
+        if within < base {
+            return None;
+        }
+        if within < base + level_size(level) as u64 {
+            return Some(level_start(level) + (within - base) as usize);
+        }
+        level += 1;
+        if level > 32 {
+            return None;
+        }
+    }
+}
+
+/// Build a multiproof over a balanced container's field roots.
+///
+/// The pre-Gloas execution payload header is an ordinary container, and its state root, block
+/// number and timestamp are proven together, so this is the generating counterpart to
+/// [`multiproof::calculate_multi_merkle_root`].
+pub fn generate_multiproof(
+    field_roots: &[Hash256],
+    gindices: &[u64],
+) -> Result<Vec<Hash256>, Error> {
+    if field_roots.is_empty() {
+        return Err(Error::NoFields);
+    }
+    let leaves = field_roots.len().next_power_of_two();
+    let tree = binary_tree(field_roots, leaves);
+
+    multiproof::get_helper_indices(gindices)
+        .into_iter()
+        .map(|gindex| node_at(&tree, gindex).ok_or(Error::GindexOutOfTree { gindex }))
+        .collect()
+}
+
+/// Read the node at `gindex` from a bottom up binary tree.
+fn node_at(tree: &[Vec<Hash256>], gindex: u64) -> Option<Hash256> {
+    let depth = gindex.ilog2() as usize;
+    let total = tree.len().checked_sub(1)?;
+    let layer = tree.get(total.checked_sub(depth)?)?;
+    layer.get((gindex - (1 << depth)) as usize).copied()
 }
 
 /// Multiproofs over ordinary fixed depth containers.
@@ -570,6 +640,62 @@ mod tests {
             progressive_container_gindex(24),
             root
         ));
+    }
+
+    #[test]
+    fn gindex_inversion_round_trips() {
+        for i in 0..200 {
+            let gindex = progressive_container_gindex(i);
+            assert_eq!(field_index_for_gindex(gindex), Some(i), "field {i}");
+        }
+        // The gloas beacon state fields we care about.
+        assert_eq!(field_index_for_gindex(367), Some(20));
+        assert_eq!(field_index_for_gindex(2946), Some(23));
+        assert_eq!(field_index_for_gindex(2947), Some(24));
+        assert_eq!(field_index_for_gindex(0), None);
+        assert_eq!(field_index_for_gindex(1), None);
+    }
+
+    /// Generation and verification must agree, or the prover emits proofs the verifier rejects.
+    #[test]
+    fn generated_multiproofs_verify() {
+        use crate::proof::multiproof::calculate_multi_merkle_root;
+
+        let roots = field_roots(16);
+        let tree = binary_tree(&roots, 16);
+        let root = *tree.last().unwrap().first().unwrap();
+
+        // The pre-Gloas execution payload case: three fields of one container.
+        let indices = [16 + 2, 16 + 8, 16 + 9];
+        let picked = [roots[2], roots[8], roots[9]];
+
+        let proof = generate_multiproof(&roots, &indices).unwrap();
+        assert_eq!(
+            calculate_multi_merkle_root(&picked, &proof, &indices).unwrap(),
+            root
+        );
+    }
+
+    #[test]
+    fn generated_multiproofs_verify_across_subsets() {
+        use crate::proof::multiproof::calculate_multi_merkle_root;
+
+        let roots = field_roots(16);
+        let tree = binary_tree(&roots, 16);
+        let root = *tree.last().unwrap().first().unwrap();
+
+        for mask in 1u32..(1 << 8) {
+            let picked: Vec<usize> = (0..8).filter(|i| mask & (1 << i) != 0).collect();
+            let indices: Vec<u64> = picked.iter().map(|i| 16 + *i as u64).collect();
+            let values: Vec<Hash256> = picked.iter().map(|i| roots[*i]).collect();
+
+            let proof = generate_multiproof(&roots, &indices).unwrap();
+            assert_eq!(
+                calculate_multi_merkle_root(&values, &proof, &indices).unwrap(),
+                root,
+                "subset {mask:08b}"
+            );
+        }
     }
 
     mod multiproofs {
