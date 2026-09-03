@@ -209,19 +209,17 @@ fn tree_hash_derive_struct(
         )
     };
 
-    // Every container exposes its field roots so proofs can be built over it; `tree_hash_root`
-    // streams them and drops them, so without this they cannot be recovered from the container.
-    // Only progressive containers get `TreeHashFields`, whose helpers assume the progressive tree.
+    // Balanced containers get `ContainerFields`; progressive ones get `TreeHashFields`. The two
+    // are disjoint on purpose, so a progressive container cannot be handed to the balanced
+    // multiproof builder, which would prove against a root it never produces.
     let field_roots = field_hashes.clone();
-    let container_fields_impl = quote! {
-        impl #impl_generics tree_hash::proof::ContainerFields for #name #ty_generics #where_clause {
-            fn field_roots(&self) -> tree_hash::proof::FieldRoots {
-                let mut roots = tree_hash::proof::FieldRoots::new();
-                #(
-                    roots.push(#field_roots);
-                )*
-                roots
-            }
+    let roots_body = quote! {
+        fn field_roots(&self) -> tree_hash::proof::FieldRoots {
+            let mut roots = tree_hash::proof::FieldRoots::new();
+            #(
+                roots.push(#field_roots);
+            )*
+            roots
         }
     };
 
@@ -232,14 +230,18 @@ fn tree_hash_derive_struct(
             .packed_tokens();
         let active_fields_len = attrs::ACTIVE_FIELDS_PACKED_BYTES_LEN;
         quote! {
-            #container_fields_impl
-
             impl #impl_generics tree_hash::proof::TreeHashFields for #name #ty_generics #where_clause {
                 const ACTIVE_FIELDS: [u8; #active_fields_len] = #packed_active_fields;
+
+                #roots_body
             }
         }
     } else {
-        container_fields_impl
+        quote! {
+            impl #impl_generics tree_hash::proof::ContainerFields for #name #ty_generics #where_clause {
+                #roots_body
+            }
+        }
     };
 
     let output = quote! {

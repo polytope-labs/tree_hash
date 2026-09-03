@@ -759,7 +759,7 @@ fn provable_container() -> ProgressiveContainerProvable {
 #[test]
 fn derived_field_roots_reproduce_the_derived_root() {
     let container = provable_container();
-    assert_eq!(container.container_root(), container.tree_hash_root());
+    assert_eq!(container.container_root().unwrap(), container.tree_hash_root());
 }
 
 /// An inactive field still occupies its chunk, so it hashes as zero and every later field keeps

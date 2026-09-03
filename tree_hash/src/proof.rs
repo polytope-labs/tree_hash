@@ -38,14 +38,21 @@ use ethereum_hashing::hash32_concat;
 /// The field roots of a container, in chunk order.
 pub type FieldRoots = Vec<Hash256>;
 
-/// Any container that can hand out its field roots.
+/// A **balanced** container that can hand out its field roots.
 ///
-/// Derived by `#[derive(TreeHash)]` for both ordinary and progressive containers. `tree_hash_root`
-/// consumes the field roots as it streams them, so this trait is what makes them available a
-/// second time, whether for a balanced multiproof or a progressive branch.
+/// Derived by `#[derive(TreeHash)]` for ordinary containers only. Progressive containers get
+/// [`TreeHashFields`] instead, deliberately: their field roots merkleize into the progressive
+/// spine, so feeding them to [`generate_multiproof`], which builds a balanced tree, would yield a
+/// proof against a root the container never produces. Keeping the two traits disjoint means that
+/// mistake does not compile.
 pub trait ContainerFields {
     /// The container's field roots in chunk order.
     fn field_roots(&self) -> FieldRoots;
+
+    /// Build a balanced multiproof over this container's fields.
+    fn prove_fields(&self, gindices: &[u64]) -> Result<Vec<Hash256>, Error> {
+        generate_multiproof(&self.field_roots(), gindices)
+    }
 }
 
 /// A progressive container that can hand out its field roots, so proofs can be built over it.
@@ -53,12 +60,16 @@ pub trait ContainerFields {
 /// Derived automatically by `#[derive(TreeHash)]` with
 /// `#[tree_hash(struct_behaviour = "progressive_container")]`. `tree_hash_root` consumes the field
 /// roots as it streams them, so this trait is what makes them available a second time.
-pub trait TreeHashFields: ContainerFields {
+pub trait TreeHashFields {
     /// The packed `active_fields` bitmask mixed into the container root.
     const ACTIVE_FIELDS: [u8; BYTES_PER_CHUNK];
 
+    /// The container's field roots in chunk order, with a zero root for every inactive field so
+    /// that positions, and therefore generalized indices, stay stable across forks.
+    fn field_roots(&self) -> FieldRoots;
+
     /// The container root, which must equal this type's `tree_hash_root`.
-    fn container_root(&self) -> Hash256 {
+    fn container_root(&self) -> Result<Hash256, Error> {
         progressive_container_root(&self.field_roots(), Self::ACTIVE_FIELDS)
     }
 
@@ -100,6 +111,10 @@ pub enum Error {
     IncompleteProof,
     /// A generalized index falls outside the tree built from the supplied field roots.
     GindexOutOfTree { gindex: u64 },
+    /// `active_fields` does not describe exactly the supplied field roots. Two containers whose
+    /// roots differ only by trailing zero leaves inside one spine level would otherwise share a
+    /// root, so the bitmask has to pin the field count.
+    NonCanonicalActiveFields { highest_set: Option<usize>, fields: usize },
     /// A multiproof index set contained 0, which addresses no node.
     ZeroIndex,
     /// A multiproof index set contained the same index twice.
@@ -124,6 +139,9 @@ impl core::fmt::Display for Error {
             }
             Error::IncompleteProof => write!(f, "proof did not reach the root"),
             Error::GindexOutOfTree { gindex } => write!(f, "gindex {gindex} is outside the tree"),
+            Error::NonCanonicalActiveFields { highest_set, fields } => {
+                write!(f, "active_fields highest set bit {highest_set:?} does not match {fields} fields")
+            }
             Error::ZeroIndex => write!(f, "index 0 addresses no node"),
             Error::DuplicateIndex { gindex } => write!(f, "index {gindex} appears twice"),
             Error::OverlappingIndices { ancestor, descendant } => {
@@ -277,12 +295,37 @@ pub fn progressive_root(field_roots: &[Hash256]) -> Hash256 {
     rest_root(&level_roots(field_roots), 0)
 }
 
+/// The position of the highest set bit in `active_fields`, if any.
+fn highest_active_bit(active_fields: &[u8; BYTES_PER_CHUNK]) -> Option<usize> {
+    active_fields
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, byte)| **byte != 0)
+        .map(|(index, byte)| index * 8 + (7 - byte.leading_zeros() as usize))
+}
+
+/// Check that `active_fields` describes exactly `len` fields.
+///
+/// The spec's canonical form requires the bitmask's highest set bit to sit at the last field. The
+/// derive already refuses a trailing zero at compile time, so this only guards the raw API: without
+/// it, two containers differing solely by trailing zero leaves within a spine level would produce
+/// the same root, and the root would not commit to how many fields were declared.
+fn check_active_fields(active_fields: &[u8; BYTES_PER_CHUNK], len: usize) -> Result<(), Error> {
+    let highest_set = highest_active_bit(active_fields);
+    if highest_set != len.checked_sub(1) {
+        return Err(Error::NonCanonicalActiveFields { highest_set, fields: len });
+    }
+    Ok(())
+}
+
 /// The full container root, with `active_fields` mixed in.
 pub fn progressive_container_root(
     field_roots: &[Hash256],
     active_fields: [u8; BYTES_PER_CHUNK],
-) -> Hash256 {
-    crate::mix_in_active_fields(&progressive_root(field_roots), active_fields)
+) -> Result<Hash256, Error> {
+    check_active_fields(&active_fields, field_roots.len())?;
+    Ok(crate::mix_in_active_fields(&progressive_root(field_roots), active_fields))
 }
 
 /// Build the merkle branch proving `field_roots[field_index]` against the container root.
@@ -303,6 +346,7 @@ pub fn progressive_container_proof(
             len: field_roots.len(),
         });
     }
+    check_active_fields(&active_fields, field_roots.len())?;
 
     let (level, offset) =
         locate(field_index).ok_or(Error::FieldIndexOutOfBounds { index: field_index, len: field_roots.len() })?;
@@ -481,12 +525,6 @@ pub mod multiproof {
         out
     }
 
-    /// True when `ancestor` sits on the path from the root to `descendant`.
-    fn is_ancestor_of(ancestor: u64, descendant: u64) -> bool {
-        let (a, d) = (ancestor.ilog2(), descendant.ilog2());
-        a <= d && (descendant >> (d - a)) == ancestor
-    }
-
     /// Reject index sets that would leave a leaf unverified.
     ///
     /// The algorithm in the consensus specs combines a node with its sibling and stops once a
@@ -494,25 +532,32 @@ pub mod multiproof {
     /// never hashed into the root, so **any** value passes for it. The spec gets away with this
     /// because it is always driven by hardcoded index sets; a runtime that takes indices from
     /// configuration or untrusted data does not have that guarantee, so the shape is checked here.
+    ///
+    /// Linearithmic rather than pairwise: duplicates fall out of a sort, and an ancestor is found
+    /// by walking each index up its own path, which is at most 64 steps, against the set.
     pub fn validate_indices(indices: &[u64]) -> Result<(), Error> {
-        // Every zero is rejected up front. `is_ancestor_of` takes a logarithm of both arguments,
-        // so a zero anywhere in the slice has to be gone before the pairwise pass begins, not just
-        // the one at the current position.
         if indices.contains(&0) {
             return Err(Error::ZeroIndex);
         }
 
-        for (i, &a) in indices.iter().enumerate() {
-            for &b in &indices[i + 1..] {
-                if a == b {
-                    return Err(Error::DuplicateIndex { gindex: a });
+        let mut sorted: Vec<u64> = indices.to_vec();
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(Error::DuplicateIndex { gindex: pair[0] });
+            }
+        }
+
+        let seen: BTreeSet<u64> = sorted.iter().copied().collect();
+        for &index in &sorted {
+            // Every strict ancestor of `index` is one of `index >> 1`, `index >> 2`, ... down to
+            // the root, so the path is walked instead of comparing against every other index.
+            let mut ancestor = index >> 1;
+            while ancestor > 0 {
+                if seen.contains(&ancestor) {
+                    return Err(Error::OverlappingIndices { ancestor, descendant: index });
                 }
-                if is_ancestor_of(a, b) {
-                    return Err(Error::OverlappingIndices { ancestor: a, descendant: b });
-                }
-                if is_ancestor_of(b, a) {
-                    return Err(Error::OverlappingIndices { ancestor: b, descendant: a });
-                }
+                ancestor >>= 1;
             }
         }
         Ok(())
@@ -805,7 +850,7 @@ mod tests {
     fn every_field_proves_against_the_root() {
         let roots = field_roots(46);
         let active = active_fields(46);
-        let root = progressive_container_root(&roots, active);
+        let root = progressive_container_root(&roots, active).unwrap();
 
         for i in 0..roots.len() {
             let branch = progressive_container_proof(&roots, active, i).unwrap();
@@ -822,7 +867,7 @@ mod tests {
         for n in 1..=100 {
             let roots = field_roots(n);
             let active = active_fields(n);
-            let root = progressive_container_root(&roots, active);
+            let root = progressive_container_root(&roots, active).unwrap();
 
             for i in 0..n {
                 let branch = progressive_container_proof(&roots, active, i).unwrap();
@@ -838,7 +883,7 @@ mod tests {
     fn a_tampered_leaf_is_rejected() {
         let roots = field_roots(46);
         let active = active_fields(46);
-        let root = progressive_container_root(&roots, active);
+        let root = progressive_container_root(&roots, active).unwrap();
 
         let branch = progressive_container_proof(&roots, active, 24).unwrap();
         let gindex = progressive_container_gindex(24).unwrap();
@@ -851,7 +896,7 @@ mod tests {
     fn a_tampered_branch_is_rejected() {
         let roots = field_roots(46);
         let active = active_fields(46);
-        let root = progressive_container_root(&roots, active);
+        let root = progressive_container_root(&roots, active).unwrap();
         let gindex = progressive_container_gindex(24).unwrap();
 
         let mut branch = progressive_container_proof(&roots, active, 24).unwrap();
@@ -868,7 +913,7 @@ mod tests {
     fn a_branch_from_the_wrong_field_is_rejected() {
         let roots = field_roots(46);
         let active = active_fields(46);
-        let root = progressive_container_root(&roots, active);
+        let root = progressive_container_root(&roots, active).unwrap();
 
         // Field 23 and 24 are siblings at the same depth, so this is not caught by length alone.
         let branch = progressive_container_proof(&roots, active, 23).unwrap();
@@ -883,17 +928,23 @@ mod tests {
     #[test]
     fn active_fields_are_bound_to_the_root() {
         let roots = field_roots(46);
-        let active = active_fields(46);
-        let root = progressive_container_root(&roots, active);
 
-        // A container claiming a different active field set must not verify against this root.
-        let branch = progressive_container_proof(&roots, active_fields(45), 24).unwrap();
-        assert!(!is_valid_merkle_branch(
-            roots[24],
-            &branch,
-            progressive_container_gindex(24).unwrap(),
-            root
-        ));
+        // Reported in review: without a canonical form check, two containers differing only by
+        // trailing zero leaves inside one spine level share a root, so the root does not commit to
+        // how many fields were declared. The mismatch is now refused rather than merely failing to
+        // verify later, which is the stronger guarantee.
+        assert_eq!(
+            progressive_container_proof(&roots, active_fields(45), 24),
+            Err(Error::NonCanonicalActiveFields { highest_set: Some(44), fields: 46 })
+        );
+        assert_eq!(
+            progressive_container_root(&roots, active_fields(45)),
+            Err(Error::NonCanonicalActiveFields { highest_set: Some(44), fields: 46 })
+        );
+        // An over-long mask is refused from the other side too.
+        assert!(progressive_container_root(&roots, active_fields(47)).is_err());
+        // The matching mask is accepted.
+        assert!(progressive_container_root(&roots, active_fields(46)).is_ok());
     }
 
     #[test]
