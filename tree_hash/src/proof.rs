@@ -38,16 +38,52 @@ use ethereum_hashing::hash32_concat;
 /// The field roots of a container, in chunk order.
 pub type FieldRoots = Vec<Hash256>;
 
+/// The field roots of a **balanced** container, which is what [`generate_multiproof`] accepts.
+///
+/// This is a distinct type from [`FieldRoots`] on purpose. A progressive container's roots
+/// merkleize into the progressive spine, not a balanced tree, so handing them to the balanced
+/// multiproof builder would produce a proof against a root the container never has. Only
+/// [`ContainerFields::field_roots`] produces this type implicitly; building one by hand with
+/// [`BalancedFieldRoots::new`] is a deliberate statement that the roots form a balanced tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BalancedFieldRoots(FieldRoots);
+
+impl BalancedFieldRoots {
+    /// Wrap roots that are known to merkleize as a balanced tree padded to a power of two.
+    pub fn new(roots: FieldRoots) -> Self {
+        Self(roots)
+    }
+
+    /// The roots in chunk order.
+    pub fn as_slice(&self) -> &[Hash256] {
+        &self.0
+    }
+
+    /// Unwrap the roots.
+    pub fn into_inner(self) -> FieldRoots {
+        self.0
+    }
+}
+
+impl core::ops::Deref for BalancedFieldRoots {
+    type Target = [Hash256];
+
+    fn deref(&self) -> &[Hash256] {
+        &self.0
+    }
+}
+
 /// A **balanced** container that can hand out its field roots.
 ///
 /// Derived by `#[derive(TreeHash)]` for ordinary containers only. Progressive containers get
 /// [`TreeHashFields`] instead, deliberately: their field roots merkleize into the progressive
 /// spine, so feeding them to [`generate_multiproof`], which builds a balanced tree, would yield a
-/// proof against a root the container never produces. Keeping the two traits disjoint means that
-/// mistake does not compile.
+/// proof against a root the container never produces. The two traits return different types,
+/// [`BalancedFieldRoots`] here and plain [`FieldRoots`] there, and `generate_multiproof` accepts
+/// only the former, so that mistake is a type error rather than a wrong root at runtime.
 pub trait ContainerFields {
     /// The container's field roots in chunk order.
-    fn field_roots(&self) -> FieldRoots;
+    fn field_roots(&self) -> BalancedFieldRoots;
 
     /// Build a balanced multiproof over this container's fields.
     fn prove_fields(&self, gindices: &[u64]) -> Result<Vec<Hash256>, Error> {
@@ -115,6 +151,9 @@ pub enum Error {
     /// roots differ only by trailing zero leaves inside one spine level would otherwise share a
     /// root, so the bitmask has to pin the field count.
     NonCanonicalActiveFields { highest_set: Option<usize>, fields: usize },
+    /// A field that `active_fields` marks inactive carried a non-zero root. Inactive fields hash
+    /// as zero, so anything else is not a state any container can produce.
+    InactiveFieldNotZero { index: usize },
     /// A multiproof index set contained 0, which addresses no node.
     ZeroIndex,
     /// A multiproof index set contained the same index twice.
@@ -141,6 +180,9 @@ impl core::fmt::Display for Error {
             Error::GindexOutOfTree { gindex } => write!(f, "gindex {gindex} is outside the tree"),
             Error::NonCanonicalActiveFields { highest_set, fields } => {
                 write!(f, "active_fields highest set bit {highest_set:?} does not match {fields} fields")
+            }
+            Error::InactiveFieldNotZero { index } => {
+                write!(f, "field {index} is inactive but its root is not zero")
             }
             Error::ZeroIndex => write!(f, "index 0 addresses no node"),
             Error::DuplicateIndex { gindex } => write!(f, "index {gindex} appears twice"),
@@ -236,10 +278,10 @@ pub fn progressive_container_gindex(field_index: usize) -> Option<u64> {
 ///
 /// Returns `None` for an index no progressive container can hold.
 pub fn progressive_container_depth(field_index: usize) -> Option<usize> {
-    let (level, _) = locate(field_index)?;
     // `2 * level` within the binary subtree, one for the spine sibling at this level, `level` more
-    // walking back up the spine, and one for `active_fields`.
-    Some(3 * level + 2)
+    // walking back up the spine, and one for `active_fields`, which is `3 * level + 2`. It is read
+    // off the gindex rather than recomputed so the two can never disagree about which indices fit.
+    progressive_container_gindex(field_index).map(|gindex| gindex.ilog2() as usize)
 }
 
 /// Build a binary merkle tree over `leaves`, zero padding up to `size`.
@@ -261,20 +303,35 @@ fn binary_tree(leaves: &[Hash256], size: usize) -> Vec<Vec<Hash256>> {
     tree
 }
 
-/// The binary subtree root for each level covered by `field_roots`.
-fn level_roots(field_roots: &[Hash256]) -> Vec<Hash256> {
-    let mut roots = Vec::new();
+/// The binary subtree for each level covered by `field_roots`, bottom up per level.
+fn level_trees(field_roots: &[Hash256]) -> Vec<Vec<Vec<Hash256>>> {
+    let mut trees = Vec::new();
     let mut level = 0;
     while let (Some(start), Some(size)) = (level_start(level), level_size(level)) {
         if start >= field_roots.len() {
             break;
         }
         let end = (start + size).min(field_roots.len());
-        let tree = binary_tree(&field_roots[start..end], size);
-        roots.push(*tree.last().and_then(|l| l.first()).expect("tree has a root"));
+        trees.push(binary_tree(&field_roots[start..end], size));
         level += 1;
     }
-    roots
+    trees
+}
+
+/// The root of a bottom up binary tree.
+fn tree_root(tree: &[Vec<Hash256>]) -> Hash256 {
+    *tree
+        .last()
+        .and_then(|layer| layer.first())
+        .expect("tree has a root")
+}
+
+/// The binary subtree root for each level covered by `field_roots`.
+fn level_roots(field_roots: &[Hash256]) -> Vec<Hash256> {
+    level_trees(field_roots)
+        .iter()
+        .map(|tree| tree_root(tree))
+        .collect()
 }
 
 /// The root of the spine from `level` downwards, which is the sibling hanging off the right of
@@ -305,16 +362,27 @@ fn highest_active_bit(active_fields: &[u8; BYTES_PER_CHUNK]) -> Option<usize> {
         .map(|(index, byte)| index * 8 + (7 - byte.leading_zeros() as usize))
 }
 
-/// Check that `active_fields` describes exactly `len` fields.
+/// Check that `active_fields` describes exactly `field_roots`.
 ///
-/// The spec's canonical form requires the bitmask's highest set bit to sit at the last field. The
-/// derive already refuses a trailing zero at compile time, so this only guards the raw API: without
-/// it, two containers differing solely by trailing zero leaves within a spine level would produce
-/// the same root, and the root would not commit to how many fields were declared.
-fn check_active_fields(active_fields: &[u8; BYTES_PER_CHUNK], len: usize) -> Result<(), Error> {
+/// The spec's canonical form requires the bitmask's highest set bit to sit at the last field, and
+/// every inactive field to hash as zero. The derive guarantees both at compile time, so this only
+/// guards the raw API: without the first, two containers differing solely by trailing zero leaves
+/// within a spine level would produce the same root, and the root would not commit to how many
+/// fields were declared; without the second, a caller could pass a state no container produces.
+fn check_active_fields(
+    active_fields: &[u8; BYTES_PER_CHUNK],
+    field_roots: &[Hash256],
+) -> Result<(), Error> {
+    let len = field_roots.len();
     let highest_set = highest_active_bit(active_fields);
     if highest_set != len.checked_sub(1) {
         return Err(Error::NonCanonicalActiveFields { highest_set, fields: len });
+    }
+    for (index, root) in field_roots.iter().enumerate() {
+        let active = active_fields[index / 8] & (1 << (index % 8)) != 0;
+        if !active && *root != Hash256::ZERO {
+            return Err(Error::InactiveFieldNotZero { index });
+        }
     }
     Ok(())
 }
@@ -324,7 +392,7 @@ pub fn progressive_container_root(
     field_roots: &[Hash256],
     active_fields: [u8; BYTES_PER_CHUNK],
 ) -> Result<Hash256, Error> {
-    check_active_fields(&active_fields, field_roots.len())?;
+    check_active_fields(&active_fields, field_roots)?;
     Ok(crate::mix_in_active_fields(&progressive_root(field_roots), active_fields))
 }
 
@@ -346,22 +414,21 @@ pub fn progressive_container_proof(
             len: field_roots.len(),
         });
     }
-    check_active_fields(&active_fields, field_roots.len())?;
+    check_active_fields(&active_fields, field_roots)?;
 
-    let (level, offset) =
-        locate(field_index).ok_or(Error::FieldIndexOutOfBounds { index: field_index, len: field_roots.len() })?;
-    let levels = level_roots(field_roots);
-
-    let size = level_size(level).ok_or(Error::FieldIndexOutOfBounds {
+    let (level, offset) = locate(field_index).ok_or(Error::FieldIndexOutOfBounds {
         index: field_index,
         len: field_roots.len(),
     })?;
-    let start = level_start(level).ok_or(Error::FieldIndexOutOfBounds {
+
+    // Every level's subtree is built once; the field's own level is read back out of the same set
+    // rather than rebuilt.
+    let trees = level_trees(field_roots);
+    let levels: Vec<Hash256> = trees.iter().map(|tree| tree_root(tree)).collect();
+    let tree = trees.get(level).ok_or(Error::FieldIndexOutOfBounds {
         index: field_index,
         len: field_roots.len(),
     })?;
-    let end = (start + size).min(field_roots.len());
-    let tree = binary_tree(&field_roots[start..end], size);
 
     let mut branch = Vec::new();
 
@@ -462,11 +529,15 @@ pub fn field_index_for_gindex(gindex: u64) -> Option<usize> {
 ///
 /// The pre-Gloas execution payload header is an ordinary container, and its state root, block
 /// number and timestamp are proven together, so this is the generating counterpart to
-/// [`multiproof::calculate_multi_merkle_root`].
+/// [`multiproof::calculate_multi_merkle_root`] and [`multiproof::verify_merkle_multiproof`].
+///
+/// Takes [`BalancedFieldRoots`] rather than a bare slice so a progressive container's roots, which
+/// do not merkleize as a balanced tree, cannot be passed here by mistake.
 pub fn generate_multiproof(
-    field_roots: &[Hash256],
+    field_roots: &BalancedFieldRoots,
     gindices: &[u64],
 ) -> Result<Vec<Hash256>, Error> {
+    let field_roots = field_roots.as_slice();
     if field_roots.is_empty() {
         return Err(Error::NoFields);
     }
@@ -493,7 +564,12 @@ fn node_at(tree: &[Vec<Hash256>], gindex: u64) -> Option<Hash256> {
 /// Progressive containers cover the Gloas `BeaconState`, but pre-Gloas forks still prove several
 /// fields of one container at once (the execution payload header's state root, block number and
 /// timestamp), and those containers are ordinary balanced trees. This is the multiproof algorithm
-/// from the consensus specs' `ssz/merkle-proofs.md`, which both shapes share.
+/// from the SSZ specification (`ethereum/ssz-specs`, formerly `ssz/merkle-proofs.md` in
+/// `ethereum/consensus-specs`), which both shapes share.
+///
+/// Verifiers should call [`verify_merkle_multiproof`], which compares against the expected root.
+/// [`calculate_multi_merkle_root`] only recomputes a root, and a tampered leaf is never
+/// structurally invalid, so an `Ok` from it says nothing about whether the leaves are genuine.
 pub mod multiproof {
     use super::*;
     use alloc::collections::{BTreeMap, BTreeSet};
@@ -585,6 +661,11 @@ pub mod multiproof {
 
     /// Recompute the root from `leaves` at `indices`, given the `proof` nodes named by
     /// [`get_helper_indices`] in the same order.
+    ///
+    /// This is the prover side and the building block. An `Ok` here does **not** mean the leaves
+    /// are genuine, only that the proof has the right shape; a tampered leaf simply produces a
+    /// different root. Verifiers must compare the result against a root they already trust, which
+    /// is what [`verify_merkle_multiproof`] does.
     pub fn calculate_multi_merkle_root(
         leaves: &[Hash256],
         proof: &[Hash256],
@@ -634,6 +715,21 @@ pub mod multiproof {
         }
 
         objects.get(&1).copied().ok_or(Error::IncompleteProof)
+    }
+
+    /// Verify that `proof` places `leaves` at `indices` under `root`.
+    ///
+    /// The verifier side of [`calculate_multi_merkle_root`]: the recomputed root is compared to
+    /// the expected one here, so the caller cannot mistake a well formed proof of the wrong values
+    /// for a valid one. As with [`is_valid_merkle_branch`](super::is_valid_merkle_branch), the
+    /// indices must come from the verifier's own configuration, never from the prover.
+    pub fn verify_merkle_multiproof(
+        leaves: &[Hash256],
+        proof: &[Hash256],
+        indices: &[u64],
+        root: Hash256,
+    ) -> bool {
+        calculate_multi_merkle_root(leaves, proof, indices) == Ok(root)
     }
 }
 
@@ -741,7 +837,10 @@ mod tests {
             calculate_multi_merkle_root(&[leaf, leaf], &[], &[4, 0]),
             Err(Error::ZeroIndex)
         );
-        assert_eq!(generate_multiproof(&[leaf], &[4, 0]), Err(Error::ZeroIndex));
+        assert_eq!(
+            generate_multiproof(&BalancedFieldRoots::new(vec![leaf]), &[4, 0]),
+            Err(Error::ZeroIndex)
+        );
     }
 
     /// Indices at mixed depths that do not overlap must still be accepted.
@@ -752,19 +851,96 @@ mod tests {
         assert_eq!(validate_indices(&[4, 6]), Ok(()));
     }
 
-    /// Reported in the second review: the ceiling now comes from what a `usize` holds on the
-    /// target, so every level the arithmetic admits is reachable from both directions.
+    /// Reported in review: the deepest level that fits both a `usize` field index and a `u64`
+    /// gindex must be reachable from both directions, and the level past it refused by both. On a
+    /// 64 bit host that is level 20 (the `u64` gindex runs out first); on wasm32 it is level 15.
     #[test]
     fn the_top_level_round_trips() {
         let mut level = 0;
-        while level_start(level + 1).is_some() {
+        while level_start(level + 1)
+            .and_then(progressive_container_gindex)
+            .is_some()
+        {
             level += 1;
         }
-        // `level` is now the deepest level this target can represent.
         let first = level_start(level).expect("the top level has a start");
-        if let Some(gindex) = progressive_container_gindex(first) {
-            assert_eq!(field_index_for_gindex(gindex), Some(first), "top level {level}");
+        let last = level_start(level + 1)
+            .map(|next| next - 1)
+            .unwrap_or_else(|| first + level_size(level).unwrap() - 1);
+        for field in [first, last] {
+            let gindex = progressive_container_gindex(field).expect("top level fits");
+            assert_eq!(field_index_for_gindex(gindex), Some(field), "level {level}");
+            assert_eq!(progressive_container_depth(field), Some(3 * level + 2));
         }
+        // The level above is refused from both directions, and depth agrees with gindex there too.
+        if let Some(next) = level_start(level + 1) {
+            assert_eq!(progressive_container_gindex(next), None);
+            assert_eq!(progressive_container_depth(next), None);
+        }
+        assert!(level >= 15, "at least level 15 must fit on every supported target");
+    }
+
+    /// Reported in review: `check_active_fields` pinned the highest bit but not that inactive
+    /// positions actually hold zero roots.
+    #[test]
+    fn a_non_zero_root_at_an_inactive_field_is_rejected() {
+        let mut roots = field_roots(6);
+        let mut active = active_fields(6);
+        active[0] &= !(1 << 2);
+
+        // Zero at the inactive position is the canonical state and is accepted.
+        roots[2] = Hash256::ZERO;
+        assert!(progressive_container_root(&roots, active).is_ok());
+        assert!(progressive_container_proof(&roots, active, 3).is_ok());
+
+        roots[2] = Hash256::repeat_byte(0xaa);
+        assert_eq!(
+            progressive_container_root(&roots, active),
+            Err(Error::InactiveFieldNotZero { index: 2 })
+        );
+        assert_eq!(
+            progressive_container_proof(&roots, active, 3),
+            Err(Error::InactiveFieldNotZero { index: 2 })
+        );
+    }
+
+    /// Reported in review: `calculate_multi_merkle_root` returns `Ok` for a tampered leaf, since
+    /// tampering is never structurally invalid. The verifier entry point compares the root.
+    #[test]
+    fn verify_merkle_multiproof_compares_the_root() {
+        use crate::proof::multiproof::{calculate_multi_merkle_root, verify_merkle_multiproof};
+
+        let roots = field_roots(8);
+        let balanced = BalancedFieldRoots::new(roots.clone());
+        let root = tree_root(&binary_tree(&roots, 8));
+        let indices = [8 + 1, 8 + 6];
+        let proof = generate_multiproof(&balanced, &indices).unwrap();
+
+        assert!(verify_merkle_multiproof(
+            &[roots[1], roots[6]],
+            &proof,
+            &indices,
+            root
+        ));
+
+        // A tampered leaf still yields `Ok` from the calculator, and `false` from the verifier.
+        let tampered = [roots[2], roots[6]];
+        assert!(calculate_multi_merkle_root(&tampered, &proof, &indices).is_ok());
+        assert!(!verify_merkle_multiproof(&tampered, &proof, &indices, root));
+
+        // Malformed input is `false`, not a panic.
+        assert!(!verify_merkle_multiproof(
+            &[roots[1]],
+            &proof,
+            &indices,
+            root
+        ));
+        assert!(!verify_merkle_multiproof(
+            &[roots[1], roots[6]],
+            &proof[1..],
+            &indices,
+            root
+        ));
     }
 
     /// Sibling indices at the same depth, which is what the light client actually uses, still work.
@@ -777,7 +953,7 @@ mod tests {
         let root = *tree.last().unwrap().first().unwrap();
         let indices = [16 + 2, 16 + 8, 16 + 9];
 
-        let proof = generate_multiproof(&roots, &indices).unwrap();
+        let proof = generate_multiproof(&BalancedFieldRoots::new(roots.clone()), &indices).unwrap();
         assert_eq!(proof.len(), get_helper_indices(&indices).len());
         assert_eq!(
             calculate_multi_merkle_root(&[roots[2], roots[8], roots[9]], &proof, &indices).unwrap(),
@@ -974,7 +1150,7 @@ mod tests {
         let indices = [16 + 2, 16 + 8, 16 + 9];
         let picked = [roots[2], roots[8], roots[9]];
 
-        let proof = generate_multiproof(&roots, &indices).unwrap();
+        let proof = generate_multiproof(&BalancedFieldRoots::new(roots.clone()), &indices).unwrap();
         assert_eq!(
             calculate_multi_merkle_root(&picked, &proof, &indices).unwrap(),
             root
@@ -994,7 +1170,7 @@ mod tests {
             let indices: Vec<u64> = picked.iter().map(|i| 16 + *i as u64).collect();
             let values: Vec<Hash256> = picked.iter().map(|i| roots[*i]).collect();
 
-            let proof = generate_multiproof(&roots, &indices).unwrap();
+            let proof = generate_multiproof(&BalancedFieldRoots::new(roots.clone()), &indices).unwrap();
             assert_eq!(
                 calculate_multi_merkle_root(&values, &proof, &indices).unwrap(),
                 root,

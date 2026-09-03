@@ -210,17 +210,15 @@ fn tree_hash_derive_struct(
     };
 
     // Balanced containers get `ContainerFields`; progressive ones get `TreeHashFields`. The two
-    // are disjoint on purpose, so a progressive container cannot be handed to the balanced
-    // multiproof builder, which would prove against a root it never produces.
+    // are disjoint on purpose and return different types, so a progressive container's roots
+    // cannot be handed to the balanced multiproof builder, which would prove against a root it
+    // never produces; that is a type error rather than a runtime mismatch.
     let field_roots = field_hashes.clone();
-    let roots_body = quote! {
-        fn field_roots(&self) -> tree_hash::proof::FieldRoots {
-            let mut roots = tree_hash::proof::FieldRoots::new();
-            #(
-                roots.push(#field_roots);
-            )*
-            roots
-        }
+    let collect_roots = quote! {
+        let mut roots = tree_hash::proof::FieldRoots::new();
+        #(
+            roots.push(#field_roots);
+        )*
     };
 
     let fields_impl = if let StructBehaviour::ProgressiveContainer = struct_behaviour {
@@ -233,13 +231,19 @@ fn tree_hash_derive_struct(
             impl #impl_generics tree_hash::proof::TreeHashFields for #name #ty_generics #where_clause {
                 const ACTIVE_FIELDS: [u8; #active_fields_len] = #packed_active_fields;
 
-                #roots_body
+                fn field_roots(&self) -> tree_hash::proof::FieldRoots {
+                    #collect_roots
+                    roots
+                }
             }
         }
     } else {
         quote! {
             impl #impl_generics tree_hash::proof::ContainerFields for #name #ty_generics #where_clause {
-                #roots_body
+                fn field_roots(&self) -> tree_hash::proof::BalancedFieldRoots {
+                    #collect_roots
+                    tree_hash::proof::BalancedFieldRoots::new(roots)
+                }
             }
         }
     };

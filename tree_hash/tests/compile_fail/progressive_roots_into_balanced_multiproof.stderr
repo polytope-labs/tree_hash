@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/progressive_roots_into_balanced_multiproof.rs:17:33
+   |
+17 |     let _ = generate_multiproof(&foo.field_roots(), &[2]);
+   |             ------------------- ^^^^^^^^^^^^^^^^^^ expected `&BalancedFieldRoots`, found `&Vec<FixedBytes<32>>`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&BalancedFieldRoots`
+              found reference `&Vec<alloy_primitives::bits::fixed::FixedBytes<32>>`
+note: function defined here
+  --> src/proof.rs
+   |
+   | pub fn generate_multiproof(
+   |        ^^^^^^^^^^^^^^^^^^^
