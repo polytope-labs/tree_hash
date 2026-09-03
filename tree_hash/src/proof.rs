@@ -50,6 +50,10 @@ pub struct BalancedFieldRoots(FieldRoots);
 
 impl BalancedFieldRoots {
     /// Wrap roots that are known to merkleize as a balanced tree padded to a power of two.
+    ///
+    /// Nothing about a list of roots reveals which tree shape it belongs to, so this cannot be
+    /// checked; the caller is asserting it. Prefer [`ContainerFields::field_roots`], which the
+    /// derive only implements for balanced containers.
     pub fn new(roots: FieldRoots) -> Self {
         Self(roots)
     }
@@ -73,6 +77,15 @@ impl core::ops::Deref for BalancedFieldRoots {
     }
 }
 
+impl<'a> IntoIterator for &'a BalancedFieldRoots {
+    type Item = &'a Hash256;
+    type IntoIter = core::slice::Iter<'a, Hash256>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// A **balanced** container that can hand out its field roots.
 ///
 /// Derived by `#[derive(TreeHash)]` for ordinary containers only. Progressive containers get
@@ -80,7 +93,9 @@ impl core::ops::Deref for BalancedFieldRoots {
 /// spine, so feeding them to [`generate_multiproof`], which builds a balanced tree, would yield a
 /// proof against a root the container never produces. The two traits return different types,
 /// [`BalancedFieldRoots`] here and plain [`FieldRoots`] there, and `generate_multiproof` accepts
-/// only the former, so that mistake is a type error rather than a wrong root at runtime.
+/// only the former, so with the derived impls that mistake is a type error rather than a wrong
+/// root at runtime. A hand written impl of this trait for a progressive type, or an explicit
+/// [`BalancedFieldRoots::new`], is a deliberate act and gets no such protection.
 pub trait ContainerFields {
     /// The container's field roots in chunk order.
     fn field_roots(&self) -> BalancedFieldRoots;
@@ -388,6 +403,9 @@ fn check_active_fields(
 }
 
 /// The full container root, with `active_fields` mixed in.
+///
+/// `active_fields` is a single chunk, so at most 256 fields can be described; a longer
+/// `field_roots` is refused as non canonical, matching the derive's limit.
 pub fn progressive_container_root(
     field_roots: &[Hash256],
     active_fields: [u8; BYTES_PER_CHUNK],
@@ -567,9 +585,11 @@ fn node_at(tree: &[Vec<Hash256>], gindex: u64) -> Option<Hash256> {
 /// from the SSZ specification (`ethereum/ssz-specs`, formerly `ssz/merkle-proofs.md` in
 /// `ethereum/consensus-specs`), which both shapes share.
 ///
-/// Verifiers should call [`verify_merkle_multiproof`], which compares against the expected root.
-/// [`calculate_multi_merkle_root`] only recomputes a root, and a tampered leaf is never
-/// structurally invalid, so an `Ok` from it says nothing about whether the leaves are genuine.
+/// Verifiers should call [`verify_merkle_multiproof`](multiproof::verify_merkle_multiproof), which
+/// compares against the expected root.
+/// [`calculate_multi_merkle_root`](multiproof::calculate_multi_merkle_root) only recomputes a
+/// root, and a tampered leaf is never structurally invalid, so an `Ok` from it says nothing about
+/// whether the leaves are genuine.
 pub mod multiproof {
     use super::*;
     use alloc::collections::{BTreeMap, BTreeSet};
@@ -721,8 +741,8 @@ pub mod multiproof {
     ///
     /// The verifier side of [`calculate_multi_merkle_root`]: the recomputed root is compared to
     /// the expected one here, so the caller cannot mistake a well formed proof of the wrong values
-    /// for a valid one. As with [`is_valid_merkle_branch`](super::is_valid_merkle_branch), the
-    /// indices must come from the verifier's own configuration, never from the prover.
+    /// for a valid one. As with [`is_valid_merkle_branch`], the indices must come from the
+    /// verifier's own configuration, never from the prover.
     pub fn verify_merkle_multiproof(
         leaves: &[Hash256],
         proof: &[Hash256],
