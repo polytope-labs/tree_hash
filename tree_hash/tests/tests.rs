@@ -3,7 +3,8 @@ use ssz::ProgressiveBitList;
 use ssz_derive::Encode;
 use std::str::FromStr;
 use tree_hash::proof::{
-    is_valid_merkle_branch, progressive_container_gindex, ContainerFields, TreeHashFields,
+    is_valid_merkle_branch, multiproof::verify_merkle_multiproof, progressive_container_gindex,
+    ContainerFields, TreeHashFields,
 };
 use tree_hash::{
     merkle_root, mix_in_active_fields, Hash256, MerkleHasher, PackedEncoding,
@@ -807,4 +808,39 @@ fn derived_proofs_are_bound_to_their_field() {
         progressive_container_gindex(24).unwrap(),
         root
     ));
+}
+
+/// A balanced container, the shape of the pre-Gloas execution payload header whose fields are
+/// proven together.
+#[derive(TreeHash)]
+struct BalancedProvable {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+}
+
+/// The derived `prove_fields` on a balanced container verifies through the root comparing entry
+/// point, and a substituted leaf does not.
+#[test]
+fn derived_balanced_multiproof_verifies_against_the_root() {
+    let container = BalancedProvable {
+        a: 1,
+        b: 2,
+        c: 3,
+        d: 4,
+        e: 5,
+    };
+    let root = container.tree_hash_root();
+
+    // Five fields pad to eight leaves, so field `i` sits at gindex `8 + i`.
+    let indices = [8 + 1, 8 + 4];
+    let proof = container.prove_fields(&indices).unwrap();
+
+    let leaves = [2u64.tree_hash_root(), 5u64.tree_hash_root()];
+    assert!(verify_merkle_multiproof(&leaves, &proof, &indices, root));
+
+    let tampered = [3u64.tree_hash_root(), 5u64.tree_hash_root()];
+    assert!(!verify_merkle_multiproof(&tampered, &proof, &indices, root));
 }
