@@ -136,28 +136,20 @@ impl core::fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// The deepest level whose spine base still fits in a `u64`.
+/// The number of leaves in the binary subtree at `level`, or `None` once that no longer fits.
 ///
-/// Level `k`'s base is `(2^(k+2) - 2) * 4^k`, which passes `u64::MAX` just after level 20. Levels
-/// beyond this cannot address a real field, so they are refused rather than allowed to wrap.
-const MAX_LEVEL: usize = 20;
-
-/// The number of leaves in the binary subtree at `level`, or `None` past [`MAX_LEVEL`].
-const fn level_size(level: usize) -> Option<usize> {
-    if level > MAX_LEVEL {
-        return None;
-    }
-    Some(1usize << (2 * level))
+/// The ceiling is whatever `usize` can actually hold on the target rather than a constant derived
+/// from `u64`: on a 32 bit target such as wasm32 the shift runs out at level 16, and a hardcoded
+/// 64 bit bound would wrap there instead of refusing.
+fn level_size(level: usize) -> Option<usize> {
+    1usize.checked_shl(u32::try_from(level.checked_mul(2)?).ok()?)
 }
 
-/// The index of the first field held by `level`, or `None` past [`MAX_LEVEL`].
+/// The index of the first field held by `level`, or `None` once that no longer fits a `usize`.
 ///
 /// Levels hold `1, 4, 16, 64, ...` fields, so the first index of level `k` is `(4^k - 1) / 3`.
-const fn level_start(level: usize) -> Option<usize> {
-    match level_size(level) {
-        Some(size) => Some((size - 1) / 3),
-        None => None,
-    }
+fn level_start(level: usize) -> Option<usize> {
+    Some((level_size(level)? - 1) / 3)
 }
 
 /// The level holding `field_index`, and the offset of the field within that level.
@@ -169,24 +161,28 @@ fn locate(field_index: usize) -> Option<(usize, usize)> {
     let mut level = 0;
     loop {
         match level_start(level + 1) {
+            // The next level starts at or below this index, so keep walking up the spine.
             Some(next) if next <= field_index => level += 1,
-            Some(_) => break,
-            None => return None,
+            // Either the next level starts past this index, or there is no next level. Both mean
+            // the index belongs to this one, if it fits; bailing out on the ceiling would make the
+            // topmost level unreachable even though its gindices invert.
+            _ => break,
         }
     }
     let start = level_start(level)?;
-    Some((level, field_index - start))
+    let offset = field_index.checked_sub(start)?;
+    if offset >= level_size(level)? {
+        return None;
+    }
+    Some((level, offset))
 }
 
 /// The generalized index of the left (binary subtree) child at `level`, within the progressive
 /// tree alone, before `active_fields` is mixed in.
 ///
 /// The spine puts these at `2, 6, 14, 30, ...`, which is `2^(k + 2) - 2`.
-const fn level_gindex(level: usize) -> Option<u64> {
-    if level > MAX_LEVEL {
-        return None;
-    }
-    Some((1u64 << (level + 2)) - 2)
+fn level_gindex(level: usize) -> Option<u64> {
+    1u64.checked_shl(u32::try_from(level.checked_add(2)?).ok()?)?.checked_sub(2)
 }
 
 /// The generalized index of `field_index` in a progressive container.
@@ -415,9 +411,6 @@ pub fn field_index_for_gindex(gindex: u64) -> Option<usize> {
             return Some(level_start(level)? + (within - base) as usize);
         }
         level += 1;
-        if level > MAX_LEVEL {
-            return None;
-        }
     }
 }
 
@@ -502,10 +495,14 @@ pub mod multiproof {
     /// because it is always driven by hardcoded index sets; a runtime that takes indices from
     /// configuration or untrusted data does not have that guarantee, so the shape is checked here.
     pub fn validate_indices(indices: &[u64]) -> Result<(), Error> {
+        // Every zero is rejected up front. `is_ancestor_of` takes a logarithm of both arguments,
+        // so a zero anywhere in the slice has to be gone before the pairwise pass begins, not just
+        // the one at the current position.
+        if indices.contains(&0) {
+            return Err(Error::ZeroIndex);
+        }
+
         for (i, &a) in indices.iter().enumerate() {
-            if a == 0 {
-                return Err(Error::ZeroIndex);
-            }
             for &b in &indices[i + 1..] {
                 if a == b {
                     return Err(Error::DuplicateIndex { gindex: a });
@@ -670,6 +667,59 @@ mod tests {
             calculate_multi_merkle_root(&[garbage, leaf], &[], &[0, 4]),
             Err(Error::ZeroIndex)
         );
+    }
+
+    /// The ceiling must follow the target's pointer width, not a constant derived from `u64`.
+    /// On wasm32 the shift runs out at level 16; on a 64 bit host at level 32. Checking it against
+    /// `usize::BITS` makes the property hold wherever this is compiled, including the runtime.
+    #[test]
+    fn level_size_stops_at_the_target_width() {
+        let last = (usize::BITS / 2) as usize;
+        assert!(level_size(last - 1).is_some(), "level {} should fit", last - 1);
+        assert_eq!(level_size(last), None, "level {last} should not fit");
+        assert_eq!(level_size(usize::MAX), None);
+    }
+
+    /// Reported in the second review: the zero check ran per element, but `is_ancestor_of` takes a
+    /// logarithm of both arguments, so a zero anywhere after the first index panicked before its
+    /// own turn came round. The original test only covered the passing order.
+    #[test]
+    fn a_zero_index_is_rejected_in_any_position() {
+        use crate::proof::multiproof::{calculate_multi_merkle_root, validate_indices};
+
+        for indices in [vec![0, 4], vec![4, 0], vec![4, 0, 8], vec![4, 8, 0], vec![0]] {
+            assert_eq!(validate_indices(&indices), Err(Error::ZeroIndex), "{indices:?}");
+        }
+
+        let leaf = Hash256::repeat_byte(1);
+        assert_eq!(
+            calculate_multi_merkle_root(&[leaf, leaf], &[], &[4, 0]),
+            Err(Error::ZeroIndex)
+        );
+        assert_eq!(generate_multiproof(&[leaf], &[4, 0]), Err(Error::ZeroIndex));
+    }
+
+    /// Indices at mixed depths that do not overlap must still be accepted.
+    #[test]
+    fn mixed_depth_indices_are_accepted() {
+        use crate::proof::multiproof::validate_indices;
+        assert_eq!(validate_indices(&[2, 6]), Ok(()));
+        assert_eq!(validate_indices(&[4, 6]), Ok(()));
+    }
+
+    /// Reported in the second review: the ceiling now comes from what a `usize` holds on the
+    /// target, so every level the arithmetic admits is reachable from both directions.
+    #[test]
+    fn the_top_level_round_trips() {
+        let mut level = 0;
+        while level_start(level + 1).is_some() {
+            level += 1;
+        }
+        // `level` is now the deepest level this target can represent.
+        let first = level_start(level).expect("the top level has a start");
+        if let Some(gindex) = progressive_container_gindex(first) {
+            assert_eq!(field_index_for_gindex(gindex), Some(first), "top level {level}");
+        }
     }
 
     /// Sibling indices at the same depth, which is what the light client actually uses, still work.
