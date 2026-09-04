@@ -1,5 +1,5 @@
-use alloc::{vec, vec::Vec};
 use super::*;
+use alloc::{vec, vec::Vec};
 use ethereum_hashing::hash;
 
 /// Merkleizes bytes and returns the root, using a simple algorithm that does not optimize to avoid

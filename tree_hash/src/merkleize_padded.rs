@@ -1,5 +1,5 @@
-use alloc::{vec, vec::Vec};
 use super::{get_zero_hash, Hash256, BYTES_PER_CHUNK};
+use alloc::{vec, vec::Vec};
 use ethereum_hashing::{hash32_concat, hash_fixed};
 
 /// Merkleize `bytes` and return the root, optionally padding the tree out to `min_leaves` number of

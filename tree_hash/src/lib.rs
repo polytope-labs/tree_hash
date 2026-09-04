@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-
 pub mod impls;
 mod merkle_hasher;
 mod merkleize_padded;

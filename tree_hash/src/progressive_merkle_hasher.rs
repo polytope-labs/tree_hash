@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::{Hash256, MerkleHasher, BYTES_PER_CHUNK};
+use alloc::vec::Vec;
 use ethereum_hashing::hash32_concat;
 use smallvec::SmallVec;
 

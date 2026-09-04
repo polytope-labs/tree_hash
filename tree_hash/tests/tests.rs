@@ -718,7 +718,9 @@ fn progressive_container_and_compatible_union_are_container_type() {
 #[derive(TreeHash)]
 #[tree_hash(
     struct_behaviour = "progressive_container",
-    active_fields(1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+    active_fields(
+        1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    )
 )]
 struct ProgressiveContainerProvable {
     a: u64,
@@ -750,8 +752,30 @@ struct ProgressiveContainerProvable {
 
 fn provable_container() -> ProgressiveContainerProvable {
     ProgressiveContainerProvable {
-        a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12,
-        m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20, u: 21, v: 22, w: 23, x: 24,
+        a: 1,
+        b: 2,
+        c: 3,
+        d: 4,
+        e: 5,
+        f: 6,
+        g: 7,
+        h: 8,
+        i: 9,
+        j: 10,
+        k: 11,
+        l: 12,
+        m: 13,
+        n: 14,
+        o: 15,
+        p: 16,
+        q: 17,
+        r: 18,
+        s: 19,
+        t: 20,
+        u: 21,
+        v: 22,
+        w: 23,
+        x: 24,
     }
 }
 
@@ -760,7 +784,10 @@ fn provable_container() -> ProgressiveContainerProvable {
 #[test]
 fn derived_field_roots_reproduce_the_derived_root() {
     let container = provable_container();
-    assert_eq!(container.container_root().unwrap(), container.tree_hash_root());
+    assert_eq!(
+        container.container_root().unwrap(),
+        container.tree_hash_root()
+    );
 }
 
 /// An inactive field still occupies its chunk, so it hashes as zero and every later field keeps
@@ -783,7 +810,12 @@ fn derived_container_fields_prove_against_the_root() {
     for index in 0..25 {
         let (leaf, branch) = container.prove_field(index).unwrap();
         assert!(
-            is_valid_merkle_branch(leaf, &branch, progressive_container_gindex(index).unwrap(), root),
+            is_valid_merkle_branch(
+                leaf,
+                &branch,
+                progressive_container_gindex(index).unwrap(),
+                root
+            ),
             "field {index} failed to verify against the derived root"
         );
     }

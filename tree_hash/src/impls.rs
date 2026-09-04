@@ -1,7 +1,7 @@
 use super::*;
+use alloc::sync::Arc;
 use alloy_primitives::{Address, FixedBytes, U128, U256};
 use ssz::{Bitfield, Fixed, Progressive, Variable};
-use alloc::sync::Arc;
 use typenum::Unsigned;
 
 fn int_to_hash256(int: u64) -> Hash256 {
@@ -267,8 +267,8 @@ impl<N: Unsigned + Clone> TreeHash for Bitfield<Fixed<N>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use ssz::{BitList, BitVector};
     use core::str::FromStr;
+    use ssz::{BitList, BitVector};
     use typenum::{U32, U8};
 
     #[test]

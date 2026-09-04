@@ -136,12 +136,10 @@ pub trait TreeHashFields {
 
     fn prove_field(&self, field_index: usize) -> Result<(Hash256, Vec<Hash256>), Error> {
         let roots = self.field_roots();
-        let leaf = *roots
-            .get(field_index)
-            .ok_or(Error::FieldIndexOutOfBounds {
-                index: field_index,
-                len: roots.len(),
-            })?;
+        let leaf = *roots.get(field_index).ok_or(Error::FieldIndexOutOfBounds {
+            index: field_index,
+            len: roots.len(),
+        })?;
         let branch = progressive_container_proof(&roots, Self::ACTIVE_FIELDS, field_index)?;
         Ok((leaf, branch))
     }
@@ -165,7 +163,10 @@ pub enum Error {
     /// `active_fields` does not describe exactly the supplied field roots. Two containers whose
     /// roots differ only by trailing zero leaves inside one spine level would otherwise share a
     /// root, so the bitmask has to pin the field count.
-    NonCanonicalActiveFields { highest_set: Option<usize>, fields: usize },
+    NonCanonicalActiveFields {
+        highest_set: Option<usize>,
+        fields: usize,
+    },
     /// A field that `active_fields` marks inactive carried a non-zero root. Inactive fields hash
     /// as zero, so anything else is not a state any container can produce.
     InactiveFieldNotZero { index: usize },
@@ -193,15 +194,24 @@ impl core::fmt::Display for Error {
             }
             Error::IncompleteProof => write!(f, "proof did not reach the root"),
             Error::GindexOutOfTree { gindex } => write!(f, "gindex {gindex} is outside the tree"),
-            Error::NonCanonicalActiveFields { highest_set, fields } => {
-                write!(f, "active_fields highest set bit {highest_set:?} does not match {fields} fields")
+            Error::NonCanonicalActiveFields {
+                highest_set,
+                fields,
+            } => {
+                write!(
+                    f,
+                    "active_fields highest set bit {highest_set:?} does not match {fields} fields"
+                )
             }
             Error::InactiveFieldNotZero { index } => {
                 write!(f, "field {index} is inactive but its root is not zero")
             }
             Error::ZeroIndex => write!(f, "index 0 addresses no node"),
             Error::DuplicateIndex { gindex } => write!(f, "index {gindex} appears twice"),
-            Error::OverlappingIndices { ancestor, descendant } => {
+            Error::OverlappingIndices {
+                ancestor,
+                descendant,
+            } => {
                 write!(f, "index {ancestor} is an ancestor of {descendant}")
             }
         }
@@ -257,7 +267,8 @@ fn locate(field_index: usize) -> Option<(usize, usize)> {
 ///
 /// The spine puts these at `2, 6, 14, 30, ...`, which is `2^(k + 2) - 2`.
 fn level_gindex(level: usize) -> Option<u64> {
-    1u64.checked_shl(u32::try_from(level.checked_add(2)?).ok()?)?.checked_sub(2)
+    1u64.checked_shl(u32::try_from(level.checked_add(2)?).ok()?)?
+        .checked_sub(2)
 }
 
 /// The generalized index of `field_index` in a progressive container.
@@ -391,7 +402,10 @@ fn check_active_fields(
     let len = field_roots.len();
     let highest_set = highest_active_bit(active_fields);
     if highest_set != len.checked_sub(1) {
-        return Err(Error::NonCanonicalActiveFields { highest_set, fields: len });
+        return Err(Error::NonCanonicalActiveFields {
+            highest_set,
+            fields: len,
+        });
     }
     for (index, root) in field_roots.iter().enumerate() {
         let active = active_fields[index / 8] & (1 << (index % 8)) != 0;
@@ -411,7 +425,10 @@ pub fn progressive_container_root(
     active_fields: [u8; BYTES_PER_CHUNK],
 ) -> Result<Hash256, Error> {
     check_active_fields(&active_fields, field_roots)?;
-    Ok(crate::mix_in_active_fields(&progressive_root(field_roots), active_fields))
+    Ok(crate::mix_in_active_fields(
+        &progressive_root(field_roots),
+        active_fields,
+    ))
 }
 
 /// Build the merkle branch proving `field_roots[field_index]` against the container root.
@@ -651,7 +668,10 @@ pub mod multiproof {
             let mut ancestor = index >> 1;
             while ancestor > 0 {
                 if seen.contains(&ancestor) {
-                    return Err(Error::OverlappingIndices { ancestor, descendant: index });
+                    return Err(Error::OverlappingIndices {
+                        ancestor,
+                        descendant: index,
+                    });
                 }
                 ancestor >>= 1;
             }
@@ -811,12 +831,18 @@ mod tests {
         // ancestor / descendant
         assert_eq!(
             calculate_multi_merkle_root(&[leaf, garbage], &[], &[2, 5]),
-            Err(Error::OverlappingIndices { ancestor: 2, descendant: 5 })
+            Err(Error::OverlappingIndices {
+                ancestor: 2,
+                descendant: 5
+            })
         );
         // the root itself as an index
         assert_eq!(
             calculate_multi_merkle_root(&[leaf, garbage], &[], &[1, 4]),
-            Err(Error::OverlappingIndices { ancestor: 1, descendant: 4 })
+            Err(Error::OverlappingIndices {
+                ancestor: 1,
+                descendant: 4
+            })
         );
         // duplicates
         assert_eq!(
@@ -836,7 +862,11 @@ mod tests {
     #[test]
     fn level_size_stops_at_the_target_width() {
         let last = (usize::BITS / 2) as usize;
-        assert!(level_size(last - 1).is_some(), "level {} should fit", last - 1);
+        assert!(
+            level_size(last - 1).is_some(),
+            "level {} should fit",
+            last - 1
+        );
         assert_eq!(level_size(last), None, "level {last} should not fit");
         assert_eq!(level_size(usize::MAX), None);
     }
@@ -848,8 +878,18 @@ mod tests {
     fn a_zero_index_is_rejected_in_any_position() {
         use crate::proof::multiproof::{calculate_multi_merkle_root, validate_indices};
 
-        for indices in [vec![0, 4], vec![4, 0], vec![4, 0, 8], vec![4, 8, 0], vec![0]] {
-            assert_eq!(validate_indices(&indices), Err(Error::ZeroIndex), "{indices:?}");
+        for indices in [
+            vec![0, 4],
+            vec![4, 0],
+            vec![4, 0, 8],
+            vec![4, 8, 0],
+            vec![0],
+        ] {
+            assert_eq!(
+                validate_indices(&indices),
+                Err(Error::ZeroIndex),
+                "{indices:?}"
+            );
         }
 
         let leaf = Hash256::repeat_byte(1);
@@ -897,7 +937,10 @@ mod tests {
             assert_eq!(progressive_container_gindex(next), None);
             assert_eq!(progressive_container_depth(next), None);
         }
-        assert!(level >= 15, "at least level 15 must fit on every supported target");
+        assert!(
+            level >= 15,
+            "at least level 15 must fit on every supported target"
+        );
     }
 
     /// Reported in review: `check_active_fields` pinned the highest bit but not that inactive
@@ -1050,9 +1093,18 @@ mod tests {
 
         for i in 0..roots.len() {
             let branch = progressive_container_proof(&roots, active, i).unwrap();
-            assert_eq!(branch.len(), progressive_container_depth(i).unwrap(), "field {i}");
+            assert_eq!(
+                branch.len(),
+                progressive_container_depth(i).unwrap(),
+                "field {i}"
+            );
             assert!(
-                is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i).unwrap(), root),
+                is_valid_merkle_branch(
+                    roots[i],
+                    &branch,
+                    progressive_container_gindex(i).unwrap(),
+                    root
+                ),
                 "field {i} failed to verify"
             );
         }
@@ -1068,7 +1120,12 @@ mod tests {
             for i in 0..n {
                 let branch = progressive_container_proof(&roots, active, i).unwrap();
                 assert!(
-                    is_valid_merkle_branch(roots[i], &branch, progressive_container_gindex(i).unwrap(), root),
+                    is_valid_merkle_branch(
+                        roots[i],
+                        &branch,
+                        progressive_container_gindex(i).unwrap(),
+                        root
+                    ),
                     "container of {n} fields, field {i}"
                 );
             }
@@ -1131,11 +1188,17 @@ mod tests {
         // verify later, which is the stronger guarantee.
         assert_eq!(
             progressive_container_proof(&roots, active_fields(45), 24),
-            Err(Error::NonCanonicalActiveFields { highest_set: Some(44), fields: 46 })
+            Err(Error::NonCanonicalActiveFields {
+                highest_set: Some(44),
+                fields: 46
+            })
         );
         assert_eq!(
             progressive_container_root(&roots, active_fields(45)),
-            Err(Error::NonCanonicalActiveFields { highest_set: Some(44), fields: 46 })
+            Err(Error::NonCanonicalActiveFields {
+                highest_set: Some(44),
+                fields: 46
+            })
         );
         // An over-long mask is refused from the other side too.
         assert!(progressive_container_root(&roots, active_fields(47)).is_err());
@@ -1190,7 +1253,8 @@ mod tests {
             let indices: Vec<u64> = picked.iter().map(|i| 16 + *i as u64).collect();
             let values: Vec<Hash256> = picked.iter().map(|i| roots[*i]).collect();
 
-            let proof = generate_multiproof(&BalancedFieldRoots::new(roots.clone()), &indices).unwrap();
+            let proof =
+                generate_multiproof(&BalancedFieldRoots::new(roots.clone()), &indices).unwrap();
             assert_eq!(
                 calculate_multi_merkle_root(&values, &proof, &indices).unwrap(),
                 root,
@@ -1294,8 +1358,8 @@ mod tests {
             let helpers = get_helper_indices(&indices);
             let proof: Vec<Hash256> = helpers.iter().map(|g| node_at(&tree, *g)).collect();
 
-            let wrong = calculate_multi_merkle_root(&[leaves[3], leaves[8]], &proof, &indices)
-                .unwrap();
+            let wrong =
+                calculate_multi_merkle_root(&[leaves[3], leaves[8]], &proof, &indices).unwrap();
             assert_ne!(wrong, root);
         }
 
@@ -1308,7 +1372,10 @@ mod tests {
 
             assert_eq!(
                 calculate_multi_merkle_root(&[leaves[2]], &proof, &indices),
-                Err(Error::LeafCountMismatch { leaves: 1, indices: 2 })
+                Err(Error::LeafCountMismatch {
+                    leaves: 1,
+                    indices: 2
+                })
             );
             assert_eq!(
                 calculate_multi_merkle_root(&[leaves[2], leaves[8]], &proof[1..], &indices),

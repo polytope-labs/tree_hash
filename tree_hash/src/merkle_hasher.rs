@@ -1,7 +1,7 @@
 use crate::{get_zero_hash, Hash256, HASHSIZE};
+use core::mem;
 use ethereum_hashing::{Context, Sha256Context, HASH_LEN};
 use smallvec::{smallvec, SmallVec};
-use core::mem;
 
 type SmallVec8<T> = SmallVec<[T; 8]>;
 
