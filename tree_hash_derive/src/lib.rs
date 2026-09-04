@@ -147,7 +147,7 @@ fn tree_hash_derive_struct(
     let (field_hashes, mixin_logic) = if let StructBehaviour::ProgressiveContainer =
         struct_behaviour
     {
-        let Some(active_fields) = active_fields_opt else {
+        let Some(active_fields) = active_fields_opt.as_ref() else {
             panic!("active_fields must be provided for progressive_container");
         };
 
@@ -167,7 +167,7 @@ fn tree_hash_derive_struct(
                     )
                 };
                 active_field_index += 1;
-                field_hashes.push(quote! { self.#ident.tree_hash_root() });
+                field_hashes.push(quote! { tree_hash::TreeHash::tree_hash_root(&self.#ident) });
             } else {
                 field_hashes.push(quote! { tree_hash::Hash256::ZERO });
             }
@@ -203,10 +203,49 @@ fn tree_hash_derive_struct(
         (
             idents
                 .into_iter()
-                .map(|ident| quote! { self.#ident.tree_hash_root() })
+                .map(|ident| quote! { tree_hash::TreeHash::tree_hash_root(&self.#ident) })
                 .collect(),
             quote! { container_root },
         )
+    };
+
+    // Balanced containers get `ContainerFields`; progressive ones get `TreeHashFields`. The two
+    // are disjoint on purpose and return different types, so a progressive container's roots
+    // cannot be handed to the balanced multiproof builder, which would prove against a root it
+    // never produces; that is a type error rather than a runtime mismatch.
+    let field_roots = field_hashes.clone();
+    let collect_roots = quote! {
+        let mut roots = tree_hash::proof::FieldRoots::new();
+        #(
+            roots.push(#field_roots);
+        )*
+    };
+
+    let fields_impl = if let StructBehaviour::ProgressiveContainer = struct_behaviour {
+        let packed_active_fields = active_fields_opt
+            .as_ref()
+            .expect("active_fields is required for progressive_container")
+            .packed_tokens();
+        let active_fields_len = attrs::ACTIVE_FIELDS_PACKED_BYTES_LEN;
+        quote! {
+            impl #impl_generics tree_hash::proof::TreeHashFields for #name #ty_generics #where_clause {
+                const ACTIVE_FIELDS: [u8; #active_fields_len] = #packed_active_fields;
+
+                fn field_roots(&self) -> tree_hash::proof::FieldRoots {
+                    #collect_roots
+                    roots
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl #impl_generics tree_hash::proof::ContainerFields for #name #ty_generics #where_clause {
+                fn field_roots(&self) -> tree_hash::proof::BalancedFieldRoots {
+                    #collect_roots
+                    tree_hash::proof::BalancedFieldRoots::new(roots)
+                }
+            }
+        }
     };
 
     let output = quote! {
@@ -240,6 +279,8 @@ fn tree_hash_derive_struct(
                 #mixin_logic
             }
         }
+
+        #fields_impl
     };
     output.into()
 }
