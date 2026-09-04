@@ -16,7 +16,7 @@ categories = ["cryptography::cryptocurrencies"]
 
 # TODO: Remove once ethereum_ssz is published.
 [patch.crates-io]
-ethereum_ssz = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "8658e3af0b448a4c90f47702616b0e78a696bb18" }
-ethereum_ssz_derive = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "8658e3af0b448a4c90f47702616b0e78a696bb18" }
+ethereum_ssz = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "29fca57e449a7e0854369716c39a0db91ee7d826" }
+ethereum_ssz_derive = { git = "https://github.com/polytope-labs/ethereum_ssz", rev = "29fca57e449a7e0854369716c39a0db91ee7d826" }
 ethereum_serde_utils = { git = "https://github.com/polytope-labs/ethereum_serde_utils", rev = "5d953c2f15b1f52c67529b117b4878d946f9295d" }
-ethereum_hashing = { git = "https://github.com/polytope-labs/ethereum_hashing", rev = "30d2638547ce44cac0cdea44db32e9247d227a4a" }
+ethereum_hashing = { git = "https://github.com/polytope-labs/ethereum_hashing", rev = "7cc907ce12e6dca9c47f44cd92e37eab688c8913" }
